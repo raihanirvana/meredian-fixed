@@ -529,6 +529,10 @@ export async function claimFees({ position_address }) {
       position: new PublicKey(position_address),
     });
 
+    if (!tx) {
+      return { success: false, error: "No fees to claim — transaction is empty" };
+    }
+
     const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet]);
     log("claim", `SUCCESS tx: ${txHash}`);
     _positionsCacheAt = 0; // invalidate cache after claim
@@ -638,10 +642,10 @@ export async function closePosition({ position_address }) {
         close_reason: "agent decision",
       });
 
-      return { success: true, position: position_address, pool: poolAddress, txs: txHashes, pnl_usd: pnlUsd, pnl_pct: pnlPct };
+      return { success: true, position: position_address, pool: poolAddress, txs: txHashes, pnl_usd: pnlUsd, pnl_pct: pnlPct, base_mint: pool.lbPair.tokenXMint.toString() };
     }
 
-    return { success: true, position: position_address, pool: poolAddress, txs: txHashes };
+    return { success: true, position: position_address, pool: poolAddress, txs: txHashes, base_mint: pool.lbPair.tokenXMint.toString() };
   } catch (error) {
     log("close_error", error.message);
     return { success: false, error: error.message };

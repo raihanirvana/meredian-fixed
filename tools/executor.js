@@ -275,6 +275,19 @@ export async function executeTool(name, args) {
         notifyDeploy({ pair: args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.tx }).catch(() => {});
       } else if (name === "close_position") {
         notifyClose({ pair: args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlPct: result.pnl_pct ?? 0 }).catch(() => {});
+        // Auto-swap base token back to SOL unless user said to hold
+        if (!args.skip_swap && result.base_mint) {
+          try {
+            const balances = await getWalletBalances({});
+            const token = balances.tokens?.find(t => t.mint === result.base_mint);
+            if (token && token.usd_value >= 0.10) {
+              log("executor", `Auto-swapping ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd_value.toFixed(2)}) back to SOL`);
+              await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: token.balance });
+            }
+          } catch (e) {
+            log("executor_warn", `Auto-swap after close failed: ${e.message}`);
+          }
+        }
       }
     }
 
