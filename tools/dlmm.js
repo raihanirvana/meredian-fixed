@@ -5,13 +5,10 @@ import {
   sendAndConfirmTransaction,
 } from "@solana/web3.js";
 import BN from "bn.js";
-import bs58 from "bs58";
 import { config } from "../config.js";
 import { log } from "../logger.js";
 import {
   trackPosition,
-  markOutOfRange,
-  markInRange,
   recordClaim,
   recordClose,
   getTrackedPosition,
@@ -20,7 +17,7 @@ import {
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
 import { isPoolOnCooldown } from "../pool-memory.js";
-import { normalizeMint } from "./wallet.js";
+import { parseWalletPrivateKey } from "./wallet.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -56,7 +53,7 @@ function getWallet() {
     if (!process.env.WALLET_PRIVATE_KEY) {
       throw new Error("WALLET_PRIVATE_KEY not set");
     }
-    _wallet = Keypair.fromSecretKey(bs58.decode(process.env.WALLET_PRIVATE_KEY));
+    _wallet = Keypair.fromSecretKey(parseWalletPrivateKey(process.env.WALLET_PRIVATE_KEY));
     log("init", `Wallet: ${_wallet.publicKey.toString()}`);
   }
   return _wallet;
@@ -75,11 +72,11 @@ async function getPool(poolAddress) {
   return poolCache.get(key);
 }
 
-setInterval(() => poolCache.clear(), 5 * 60 * 1000);
+const poolCacheCleanup = setInterval(() => poolCache.clear(), 5 * 60 * 1000);
+poolCacheCleanup.unref?.();
 
 // ─── Get Active Bin ────────────────────────────────────────────
 export async function getActiveBin({ pool_address }) {
-  pool_address = normalizeMint(pool_address);
   const pool = await getPool(pool_address);
   const activeBin = await pool.getActiveBin();
 
@@ -108,7 +105,6 @@ export async function deployPosition({
   organic_score,
   initial_value_usd,
 }) {
-  pool_address = normalizeMint(pool_address);
   const activeStrategy = strategy || config.strategy.strategy;
 
   const activeBinsBelow = bins_below ?? config.strategy.binsBelow;
@@ -318,8 +314,6 @@ async function fetchDlmmPnlForPool(poolAddress, walletAddress) {
 
 // ─── Get Position PnL (Meteora API) ─────────────────────────────
 export async function getPositionPnl({ pool_address, position_address }) {
-  pool_address = normalizeMint(pool_address);
-  position_address = normalizeMint(position_address);
   const walletAddress = getWallet().publicKey.toString();
   try {
     const byAddress = await fetchDlmmPnlForPool(pool_address, walletAddress);
@@ -383,9 +377,6 @@ export async function getMyPositions({ force = false, silent = false } = {}) {
       for (const positionAddress of (pool.listPositions || [])) {
         const tracked = getTrackedPosition(positionAddress);
         const isOOR = pool.outOfRange || pool.positionsOutOfRange?.includes(positionAddress);
-
-        if (isOOR) markOutOfRange(positionAddress);
-        else markInRange(positionAddress);
 
         // Bin data: from supplemental PnL call (OOR) or tracked state (in-range)
         const binData = binDataByPool[pool.poolAddress]?.[positionAddress];
@@ -529,7 +520,6 @@ export async function searchPools({ query, limit = 10 }) {
 
 // ─── Claim Fees ────────────────────────────────────────────────
 export async function claimFees({ position_address }) {
-  position_address = normalizeMint(position_address);
   if (process.env.DRY_RUN === "true") {
     return { dry_run: true, would_claim: position_address, message: "DRY RUN — no transaction sent" };
   }
@@ -546,6 +536,12 @@ export async function claimFees({ position_address }) {
     // Clear cached pool so SDK loads fresh position fee state
     poolCache.delete(poolAddress.toString());
     const pool = await getPool(poolAddress);
+    const pnlByAddress = await fetchDlmmPnlForPool(poolAddress.toString(), wallet.publicKey.toString());
+    const pnl = pnlByAddress[position_address];
+    const claimedFeesUsd = Math.round((
+      parseFloat(pnl?.unrealizedPnl?.unclaimedFeeTokenX?.usd || 0) +
+      parseFloat(pnl?.unrealizedPnl?.unclaimedFeeTokenY?.usd || 0)
+    ) * 100) / 100;
 
     const positionData = await pool.getPosition(new PublicKey(position_address));
     const txs = await pool.claimSwapFee({
@@ -564,9 +560,9 @@ export async function claimFees({ position_address }) {
     }
     log("claim", `SUCCESS txs: ${txHashes.join(", ")}`);
     _positionsCacheAt = 0; // invalidate cache after claim
-    recordClaim(position_address);
+    recordClaim(position_address, claimedFeesUsd);
 
-    return { success: true, position: position_address, txs: txHashes, base_mint: pool.lbPair.tokenXMint.toString() };
+    return { success: true, position: position_address, txs: txHashes, base_mint: pool.lbPair.tokenXMint.toString(), claimed_fees_usd: claimedFeesUsd };
   } catch (error) {
     log("claim_error", error.message);
     return { success: false, error: error.message };
@@ -575,7 +571,6 @@ export async function claimFees({ position_address }) {
 
 // ─── Close Position ────────────────────────────────────────────
 export async function closePosition({ position_address, reason }) {
-  position_address = normalizeMint(position_address);
   if (process.env.DRY_RUN === "true") {
     return { dry_run: true, would_close: position_address, message: "DRY RUN — no transaction sent" };
   }

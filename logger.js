@@ -1,11 +1,17 @@
 import fs from "fs";
 import path from "path";
+import { LOG_DIR, ensureMeridianDir } from "./paths.js";
 
-const LOG_DIR = "./logs";
 const LOG_LEVEL = process.env.LOG_LEVEL || "info";
 
 const LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
 const currentLevel = LEVELS[LOG_LEVEL] || 1;
+
+function writeConsoleLine(line) {
+  process.stderr.write(line + "\n");
+}
+
+ensureMeridianDir();
 
 // Ensure log directory exists
 if (!fs.existsSync(LOG_DIR)) {
@@ -26,7 +32,7 @@ export function log(category, message) {
   const line = `[${timestamp}] [${category.toUpperCase()}] ${message}`;
 
   // Console output
-  console.log(line);
+  writeConsoleLine(line);
 
   // File output (daily rotation)
   const dateStr = timestamp.split("T")[0];
@@ -66,7 +72,7 @@ export function logAction(action) {
   const status = action.success ? "✓" : "✗";
   const dur = action.duration_ms != null ? ` (${action.duration_ms}ms)` : "";
   const hint = actionHint(action);
-  console.log(`[${action.tool}] ${status}${hint}${dur}`);
+  writeConsoleLine(`[${action.tool}] ${status}${hint}${dur}`);
 
   // File: full JSON for audit trail
   const dateStr = timestamp.split("T")[0];

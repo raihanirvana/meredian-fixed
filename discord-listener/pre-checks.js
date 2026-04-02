@@ -3,12 +3,15 @@
  * Stages: dedup → blacklist → pool resolution → rug check → deployer check → fees check
  */
 import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
 import axios from "axios";
+import {
+  DEV_BLOCKLIST_FILE,
+  TOKEN_BLACKLIST_FILE,
+  USER_CONFIG_PATH,
+  ensureMeridianDir,
+} from "../paths.js";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const ROOT = path.resolve(__dirname, "..");
+ensureMeridianDir();
 
 // In-memory dedup: address → timestamp
 const recentSeen = new Map();
@@ -30,7 +33,7 @@ export function dedupCheck(address) {
 
 // Stage 2: Token blacklist — reject if mint is blacklisted
 export function blacklistCheck(mint) {
-  const file = path.join(ROOT, "token-blacklist.json");
+  const file = TOKEN_BLACKLIST_FILE;
   if (!fs.existsSync(file)) return { pass: true };
   try {
     const data = JSON.parse(fs.readFileSync(file, "utf8"));
@@ -108,11 +111,11 @@ export async function rugCheck(mint) {
 
 // Stage 5: Deployer blacklist
 export async function deployerCheck(poolAddress) {
-  const file = path.join(ROOT, "deployer-blacklist.json");
+  const file = DEV_BLOCKLIST_FILE;
   if (!fs.existsSync(file)) return { pass: true };
   try {
     const data = JSON.parse(fs.readFileSync(file, "utf8"));
-    const blocked = data.addresses || [];
+    const blocked = Array.isArray(data.addresses) ? data.addresses : Object.keys(data || {});
     if (blocked.length === 0) return { pass: true };
 
     // Fetch pool creator from Meteora API
@@ -132,7 +135,7 @@ export async function feesCheck(mint) {
 
   let minFeesSol = 30;
   try {
-    const cfg = JSON.parse(fs.readFileSync(path.join(ROOT, "user-config.json"), "utf8"));
+    const cfg = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"));
     minFeesSol = cfg.screening?.minTokenFeesSol ?? cfg.minTokenFeesSol ?? 30;
   } catch { /* use default */ }
 
@@ -199,7 +202,7 @@ export async function runPreChecks(address) {
     base_mint: pool.base_mint,
     symbol: pool.symbol,
     rug_score: rug.rug_score,
-    total_fees_sol: fees.total_fees_sol,
+    total_fees_sol: fees.global_fees_sol,
     token_age_minutes: pool.token_age_minutes,
   };
 }

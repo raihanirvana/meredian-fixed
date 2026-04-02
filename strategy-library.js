@@ -8,8 +8,11 @@
 
 import fs from "fs";
 import { log } from "./logger.js";
+import { STRATEGY_LIBRARY_FILE, ensureMeridianDir } from "./paths.js";
 
-const STRATEGY_FILE = "./strategy-library.json";
+ensureMeridianDir();
+
+const STRATEGY_FILE = STRATEGY_LIBRARY_FILE;
 
 function load() {
   if (!fs.existsSync(STRATEGY_FILE)) return { active: null, strategies: {} };

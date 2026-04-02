@@ -1,10 +1,10 @@
 import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
 import { log } from "./logger.js";
+import { SMART_WALLETS_FILE, ensureMeridianDir } from "./paths.js";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const WALLETS_PATH = path.join(__dirname, "smart-wallets.json");
+ensureMeridianDir();
+
+const WALLETS_PATH = SMART_WALLETS_FILE;
 
 function loadWallets() {
   if (!fs.existsSync(WALLETS_PATH)) return { wallets: [] };

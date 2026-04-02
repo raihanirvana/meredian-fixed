@@ -7,8 +7,9 @@
 
 import fs from "fs";
 import { log } from "./logger.js";
+import { POOL_MEMORY_FILE, ensureMeridianDir } from "./paths.js";
 
-const POOL_MEMORY_FILE = "./pool-memory.json";
+ensureMeridianDir();
 
 function load() {
   if (!fs.existsSync(POOL_MEMORY_FILE)) return {};

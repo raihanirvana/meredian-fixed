@@ -10,8 +10,10 @@
 
 import fs from "fs";
 import { log } from "./logger.js";
+import { STATE_FILE, ensureMeridianDir } from "./paths.js";
 
-const STATE_FILE = "./state.json";
+ensureMeridianDir();
+const STATE_FILE_TMP = `${STATE_FILE}.tmp`;
 
 const MAX_RECENT_EVENTS = 20;
 
@@ -30,10 +32,25 @@ function load() {
 function save(state) {
   try {
     state.lastUpdated = new Date().toISOString();
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+    fs.writeFileSync(STATE_FILE_TMP, JSON.stringify(state, null, 2));
+    try {
+      fs.renameSync(STATE_FILE_TMP, STATE_FILE);
+    } catch {
+      // Windows may reject replacing an existing file via rename; fall back to replace.
+      fs.rmSync(STATE_FILE, { force: true });
+      fs.renameSync(STATE_FILE_TMP, STATE_FILE);
+    }
   } catch (err) {
     log("state_error", `Failed to write state.json: ${err.message}`);
   }
+}
+
+function mutateState(mutator) {
+  const state = load();
+  const result = mutator(state);
+  if (result?.save === false) return result?.value;
+  save(state);
+  return result?.value;
 }
 
 // ─── Position Registry ─────────────────────────────────────────
@@ -57,36 +74,37 @@ export function trackPosition({
   initial_value_usd,
   signal_snapshot = null,
 }) {
-  const state = load();
-  state.positions[position] = {
-    position,
-    pool,
-    pool_name,
-    strategy,
-    bin_range,
-    amount_sol,
-    amount_x,
-    active_bin_at_deploy: active_bin,
-    bin_step,
-    volatility,
-    fee_tvl_ratio,
-    initial_fee_tvl_24h: fee_tvl_ratio,
-    organic_score,
-    initial_value_usd,
-    signal_snapshot: signal_snapshot || null,
-    deployed_at: new Date().toISOString(),
-    out_of_range_since: null,
-    last_claim_at: null,
-    total_fees_claimed_usd: 0,
-    rebalance_count: 0,
-    closed: false,
-    closed_at: null,
-    notes: [],
-    peak_pnl_pct: 0,
-    trailing_active: false,
-  };
-  pushEvent(state, { action: "deploy", position, pool_name: pool_name || pool });
-  save(state);
+  mutateState((state) => {
+    state.positions[position] = {
+      position,
+      pool,
+      pool_name,
+      strategy,
+      bin_range,
+      amount_sol,
+      amount_x,
+      active_bin_at_deploy: active_bin,
+      bin_step,
+      volatility,
+      fee_tvl_ratio,
+      initial_fee_tvl_24h: fee_tvl_ratio,
+      organic_score,
+      initial_value_usd,
+      signal_snapshot: signal_snapshot || null,
+      deployed_at: new Date().toISOString(),
+      out_of_range_since: null,
+      last_claim_at: null,
+      total_fees_claimed_usd: 0,
+      rebalance_count: 0,
+      closed: false,
+      closed_at: null,
+      notes: [],
+      peak_pnl_pct: 0,
+      trailing_active: false,
+    };
+    pushEvent(state, { action: "deploy", position, pool_name: pool_name || pool });
+    return { value: true };
+  });
   log("state", `Tracked new position: ${position} in pool ${pool}`);
 }
 
@@ -94,28 +112,26 @@ export function trackPosition({
  * Mark a position as out of range (sets timestamp on first detection).
  */
 export function markOutOfRange(position_address) {
-  const state = load();
-  const pos = state.positions[position_address];
-  if (!pos) return;
-  if (!pos.out_of_range_since) {
+  const changed = mutateState((state) => {
+    const pos = state.positions[position_address];
+    if (!pos || pos.out_of_range_since) return { value: false, save: false };
     pos.out_of_range_since = new Date().toISOString();
-    save(state);
-    log("state", `Position ${position_address} marked out of range`);
-  }
+    return { value: true };
+  });
+  if (changed) log("state", `Position ${position_address} marked out of range`);
 }
 
 /**
  * Mark a position as back in range (clears OOR timestamp).
  */
 export function markInRange(position_address) {
-  const state = load();
-  const pos = state.positions[position_address];
-  if (!pos) return;
-  if (pos.out_of_range_since) {
+  const changed = mutateState((state) => {
+    const pos = state.positions[position_address];
+    if (!pos || !pos.out_of_range_since) return { value: false, save: false };
     pos.out_of_range_since = null;
-    save(state);
-    log("state", `Position ${position_address} back in range`);
-  }
+    return { value: true };
+  });
+  if (changed) log("state", `Position ${position_address} back in range`);
 }
 
 /**
@@ -134,13 +150,14 @@ export function minutesOutOfRange(position_address) {
  * Record a fee claim event.
  */
 export function recordClaim(position_address, fees_usd) {
-  const state = load();
-  const pos = state.positions[position_address];
-  if (!pos) return;
-  pos.last_claim_at = new Date().toISOString();
-  pos.total_fees_claimed_usd = (pos.total_fees_claimed_usd || 0) + (fees_usd || 0);
-  pos.notes.push(`Claimed ~$${fees_usd?.toFixed(2) || "?"} fees at ${pos.last_claim_at}`);
-  save(state);
+  mutateState((state) => {
+    const pos = state.positions[position_address];
+    if (!pos) return { value: false, save: false };
+    pos.last_claim_at = new Date().toISOString();
+    pos.total_fees_claimed_usd = (pos.total_fees_claimed_usd || 0) + (fees_usd || 0);
+    pos.notes.push(`Claimed ~$${fees_usd?.toFixed(2) || "?"} fees at ${pos.last_claim_at}`);
+    return { value: true };
+  });
 }
 
 /**
@@ -158,34 +175,36 @@ function pushEvent(state, event) {
  * Mark a position as closed.
  */
 export function recordClose(position_address, reason) {
-  const state = load();
-  const pos = state.positions[position_address];
-  if (!pos) return;
-  pos.closed = true;
-  pos.closed_at = new Date().toISOString();
-  pos.notes.push(`Closed at ${pos.closed_at}: ${reason}`);
-  pushEvent(state, { action: "close", position: position_address, pool_name: pos.pool_name || pos.pool, reason });
-  save(state);
-  log("state", `Position ${position_address} marked closed: ${reason}`);
+  const changed = mutateState((state) => {
+    const pos = state.positions[position_address];
+    if (!pos) return { value: false, save: false };
+    pos.closed = true;
+    pos.closed_at = new Date().toISOString();
+    pos.notes.push(`Closed at ${pos.closed_at}: ${reason}`);
+    pushEvent(state, { action: "close", position: position_address, pool_name: pos.pool_name || pos.pool, reason });
+    return { value: true };
+  });
+  if (changed) log("state", `Position ${position_address} marked closed: ${reason}`);
 }
 
 /**
  * Record a rebalance (close + redeploy).
  */
 export function recordRebalance(old_position, new_position) {
-  const state = load();
-  const old = state.positions[old_position];
-  if (old) {
-    old.closed = true;
-    old.closed_at = new Date().toISOString();
-    old.notes.push(`Rebalanced into ${new_position} at ${old.closed_at}`);
-  }
-  const newPos = state.positions[new_position];
-  if (newPos) {
-    newPos.rebalance_count = (old?.rebalance_count || 0) + 1;
-    newPos.notes.push(`Rebalanced from ${old_position}`);
-  }
-  save(state);
+  mutateState((state) => {
+    const old = state.positions[old_position];
+    if (old) {
+      old.closed = true;
+      old.closed_at = new Date().toISOString();
+      old.notes.push(`Rebalanced into ${new_position} at ${old.closed_at}`);
+    }
+    const newPos = state.positions[new_position];
+    if (newPos) {
+      newPos.rebalance_count = (old?.rebalance_count || 0) + 1;
+      newPos.notes.push(`Rebalanced from ${old_position}`);
+    }
+    return { value: true };
+  });
 }
 
 /**
@@ -193,13 +212,14 @@ export function recordRebalance(old_position, new_position) {
  * Overwrites any previous instruction. Pass null to clear.
  */
 export function setPositionInstruction(position_address, instruction) {
-  const state = load();
-  const pos = state.positions[position_address];
-  if (!pos) return false;
-  pos.instruction = instruction || null;
-  save(state);
-  log("state", `Position ${position_address} instruction set: ${instruction}`);
-  return true;
+  const changed = mutateState((state) => {
+    const pos = state.positions[position_address];
+    if (!pos) return { value: false, save: false };
+    pos.instruction = instruction || null;
+    return { value: true };
+  });
+  if (changed) log("state", `Position ${position_address} instruction set: ${instruction}`);
+  return changed;
 }
 
 /**
@@ -260,37 +280,42 @@ export function getStateSummary() {
  */
 export function updatePnlAndCheckExits(position_address, positionData, mgmtConfig) {
   const { pnl_pct: currentPnlPct, in_range, fee_per_tvl_24h } = positionData;
-  const state = load();
-  const pos = state.positions[position_address];
+  const pos = mutateState((state) => {
+    const pos = state.positions[position_address];
+    if (!pos || pos.closed) return { value: null, save: false };
+
+    let changed = false;
+
+    // Track peak PnL
+    if (currentPnlPct != null && currentPnlPct > (pos.peak_pnl_pct ?? 0)) {
+      pos.peak_pnl_pct = currentPnlPct;
+      changed = true;
+    }
+
+    // Activate trailing TP once trigger threshold is reached
+    if (mgmtConfig.trailingTakeProfit && !pos.trailing_active && currentPnlPct >= mgmtConfig.trailingTriggerPct) {
+      pos.trailing_active = true;
+      changed = true;
+      log("state", `Position ${position_address} trailing TP activated at ${currentPnlPct}% (peak: ${pos.peak_pnl_pct}%)`);
+    }
+
+    // Update OOR state
+    if (in_range === false && !pos.out_of_range_since) {
+      pos.out_of_range_since = new Date().toISOString();
+      changed = true;
+      log("state", `Position ${position_address} marked out of range`);
+    } else if (in_range === true && pos.out_of_range_since) {
+      pos.out_of_range_since = null;
+      changed = true;
+      log("state", `Position ${position_address} back in range`);
+    }
+
+    return {
+      value: { ...pos },
+      save: changed,
+    };
+  });
   if (!pos || pos.closed) return null;
-
-  let changed = false;
-
-  // Track peak PnL
-  if (currentPnlPct != null && currentPnlPct > (pos.peak_pnl_pct ?? 0)) {
-    pos.peak_pnl_pct = currentPnlPct;
-    changed = true;
-  }
-
-  // Activate trailing TP once trigger threshold is reached
-  if (mgmtConfig.trailingTakeProfit && !pos.trailing_active && currentPnlPct >= mgmtConfig.trailingTriggerPct) {
-    pos.trailing_active = true;
-    changed = true;
-    log("state", `Position ${position_address} trailing TP activated at ${currentPnlPct}% (peak: ${pos.peak_pnl_pct}%)`);
-  }
-
-  // Update OOR state
-  if (in_range === false && !pos.out_of_range_since) {
-    pos.out_of_range_since = new Date().toISOString();
-    changed = true;
-    log("state", `Position ${position_address} marked out of range`);
-  } else if (in_range === true && pos.out_of_range_since) {
-    pos.out_of_range_since = null;
-    changed = true;
-    log("state", `Position ${position_address} back in range`);
-  }
-
-  if (changed) save(state);
 
   // ── Stop loss ──────────────────────────────────────────────────
   if (currentPnlPct != null && mgmtConfig.stopLossPct != null && currentPnlPct <= mgmtConfig.stopLossPct) {
@@ -329,7 +354,7 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
     fee_per_tvl_24h != null &&
     mgmtConfig.minFeePerTvl24h != null &&
     fee_per_tvl_24h < mgmtConfig.minFeePerTvl24h &&
-    (age_minutes == null || age_minutes >= minAgeForYieldCheck)
+    (age_minutes != null && age_minutes >= minAgeForYieldCheck)
   ) {
     return {
       action: "LOW_YIELD",
@@ -354,9 +379,10 @@ export function getLastBriefingDate() {
  * Record that the briefing was sent today.
  */
 export function setLastBriefingDate() {
-  const state = load();
-  state._lastBriefingDate = new Date().toISOString().slice(0, 10); // YYYY-MM-DD UTC
-  save(state);
+  mutateState((state) => {
+    state._lastBriefingDate = new Date().toISOString().slice(0, 10); // YYYY-MM-DD UTC
+    return { value: true };
+  });
 }
 
 /**
@@ -366,27 +392,28 @@ export function setLastBriefingDate() {
 const SYNC_GRACE_MS = 5 * 60_000; // don't auto-close positions deployed < 5 min ago
 
 export function syncOpenPositions(active_addresses) {
-  const state = load();
-  const activeSet = new Set(active_addresses);
-  let changed = false;
+  return mutateState((state) => {
+    const activeSet = new Set(active_addresses);
+    let changed = false;
 
-  for (const posId in state.positions) {
-    const pos = state.positions[posId];
-    if (pos.closed || activeSet.has(posId)) continue;
+    for (const posId in state.positions) {
+      const pos = state.positions[posId];
+      if (pos.closed || activeSet.has(posId)) continue;
 
-    // Grace period: newly deployed positions may not be indexed yet
-    const deployedAt = pos.deployed_at ? new Date(pos.deployed_at).getTime() : 0;
-    if (Date.now() - deployedAt < SYNC_GRACE_MS) {
+      // Grace period: newly deployed positions may not be indexed yet
+      const deployedAt = pos.deployed_at ? new Date(pos.deployed_at).getTime() : 0;
+      if (Date.now() - deployedAt < SYNC_GRACE_MS) {
       log("state", `Position ${posId} not on-chain yet — within grace period, skipping auto-close`);
       continue;
     }
 
-    pos.closed = true;
-    pos.closed_at = new Date().toISOString();
-    pos.notes.push(`Auto-closed during state sync (not found on-chain)`);
-    changed = true;
-    log("state", `Position ${posId} auto-closed (missing from on-chain data)`);
-  }
+      pos.closed = true;
+      pos.closed_at = new Date().toISOString();
+      pos.notes.push(`Auto-closed during state sync (not found on-chain)`);
+      changed = true;
+      log("state", `Position ${posId} auto-closed (missing from on-chain data)`);
+      }
 
-  if (changed) save(state);
+    return { value: changed, save: changed };
+  });
 }

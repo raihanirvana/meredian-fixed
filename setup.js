@@ -6,14 +6,13 @@
 
 import readline from "readline";
 import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const CONFIG_PATH = path.join(__dirname, "user-config.json");
-const ENV_PATH    = path.join(__dirname, ".env");
+import { USER_CONFIG_PATH, ENV_PATH, ensureMeridianDir } from "./paths.js";
 
 const DEFAULT_MODEL = "openai/gpt-oss-20b:free";
+
+ensureMeridianDir();
+
+const CONFIG_PATH = USER_CONFIG_PATH;
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
@@ -158,7 +157,7 @@ const openrouterKey = await ask(
 
 const walletKey = await ask(
   "Wallet private key (base58)",
-  alreadySet(ev("WALLET_PRIVATE_KEY", existingConfig.walletKey || ""))
+  alreadySet(ev("WALLET_PRIVATE_KEY", ""))
 );
 
 const rpcUrl = await ask(
@@ -256,13 +255,13 @@ const maxMcap = await askNum(
 console.log("\n── Exit Rules ────────────────────────────────────────────────");
 
 const takeProfitFeePct = await askNum(
-  "Take profit when fees earned >= X% of deployed capital",
+  "Take profit when position PnL >= X%",
   p("takeProfitFeePct", 5),
   { min: 0.1, max: 100 }
 );
 
 const stopLossPct = await askNum(
-  "Stop loss at X% price drop (e.g. -15)",
+  "Stop loss when position PnL <= X% (e.g. -15)",
   p("stopLossPct", -15),
   { min: -99, max: -1 }
 );
@@ -407,8 +406,8 @@ console.log(`
   Deploy:       ${deployAmountSol} SOL/position  ·  max ${maxPositions} positions
   Min balance:  ${minSolToOpen} SOL to open new position
   Timeframe:    ${timeframe}  ·  organic ≥ ${minOrganic}  ·  holders ≥ ${minHolders}
-  Take profit:  fees ≥ ${takeProfitFeePct}%
-  Stop loss:    ${stopLossPct}% price drop
+  Take profit:  close when PnL ≥ ${takeProfitFeePct}%
+  Stop loss:    close when PnL ≤ ${stopLossPct}%
   OOR close:    after ${outOfRangeWaitMinutes} min
 
   Cycles:       management every ${managementIntervalMin}m  ·  screening every ${screeningIntervalMin}m

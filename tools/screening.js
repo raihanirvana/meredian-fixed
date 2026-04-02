@@ -15,6 +15,8 @@ const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
  */
 export async function discoverPools({
   page_size = 50,
+  timeframe = null,
+  category = null,
 } = {}) {
   const s = config.screening;
   const filters = [
@@ -40,8 +42,8 @@ export async function discoverPools({
   const url = `${POOL_DISCOVERY_BASE}/pools?` +
     `page_size=${page_size}` +
     `&filter_by=${encodeURIComponent(filters)}` +
-    `&timeframe=${s.timeframe}` +
-    `&category=${s.category}`;
+    `&timeframe=${timeframe || s.timeframe}` +
+    `&category=${category || s.category}`;
 
   const res = await fetch(url);
 
@@ -123,16 +125,22 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   const occupiedMints = new Set(positions.map((p) => p.base_mint).filter(Boolean));
 
   const eligible = pools
-    .filter((p) => !occupiedPools.has(p.pool) && !occupiedMints.has(p.base?.mint))
-    .slice(0, limit);
+    .filter((p) => !occupiedPools.has(p.pool) && !occupiedMints.has(p.base?.mint));
 
   // Enrich with OKX data — advanced info (risk/bundle/sniper) + ATH price (no API key required)
   if (eligible.length > 0) {
     const { getAdvancedInfo, getPriceInfo, getClusterList, getRiskFlags } = await import("./okx.js");
+    const { getTokenInfo } = await import("./token.js");
     const okxResults = await Promise.allSettled(
       eligible.map((p) => p.base?.mint
         ? Promise.all([getAdvancedInfo(p.base.mint), getPriceInfo(p.base.mint), getClusterList(p.base.mint), getRiskFlags(p.base.mint)])
         : Promise.resolve([null, null, [], null])
+      )
+    );
+    const tokenResults = await Promise.allSettled(
+      eligible.map((p) => p.base?.mint
+        ? getTokenInfo({ query: p.base.mint })
+        : Promise.resolve(null)
       )
     );
     for (let i = 0; i < eligible.length; i++) {
@@ -163,6 +171,14 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         eligible[i].kol_in_clusters      = clusters.some((c) => c.has_kol);
         eligible[i].top_cluster_trend    = clusters[0]?.trend ?? null;      // buy|sell|neutral
         eligible[i].top_cluster_hold_pct = clusters[0]?.holding_pct ?? null;
+      }
+      const tokenRes = tokenResults[i];
+      const token = tokenRes?.status === "fulfilled" ? tokenRes.value?.results?.[0] : null;
+      if (token) {
+        eligible[i].global_fees_sol = token.global_fees_sol ?? null;
+        eligible[i].launchpad = token.launchpad ?? null;
+        eligible[i].top_10_pct = token.audit?.top_holders_pct != null ? Number(token.audit.top_holders_pct) : null;
+        eligible[i].bot_holders_pct = token.audit?.bot_holders_pct != null ? Number(token.audit.bot_holders_pct) : null;
       }
     }
     // Wash trading hard filter — fake volume = misleading fee yield
@@ -198,10 +214,38 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     });
     eligible.splice(0, eligible.length, ...filtered);
     if (eligible.length < before) log("dev_blocklist", `Filtered ${before - eligible.length} pool(s) via OKX creator check`);
+
+    const deterministicFiltered = eligible.filter((p) => {
+      if (p.launchpad && config.screening.blockedLaunchpads.includes(p.launchpad)) {
+        log("screening", `Launchpad filter: dropped ${p.name} — blocked launchpad (${p.launchpad})`);
+        return false;
+      }
+      if (p.global_fees_sol != null && config.screening.minTokenFeesSol != null && p.global_fees_sol < config.screening.minTokenFeesSol) {
+        log("screening", `Fees filter: dropped ${p.name} — fees ${p.global_fees_sol} SOL < ${config.screening.minTokenFeesSol} SOL`);
+        return false;
+      }
+      if (p.top_10_pct != null && config.screening.maxTop10Pct != null && p.top_10_pct > config.screening.maxTop10Pct) {
+        log("screening", `Top10 filter: dropped ${p.name} — top10 ${p.top_10_pct}% > ${config.screening.maxTop10Pct}%`);
+        return false;
+      }
+      if (p.bot_holders_pct != null && config.screening.maxBotHoldersPct != null && p.bot_holders_pct > config.screening.maxBotHoldersPct) {
+        log("screening", `Bot-holder filter: dropped ${p.name} — bots ${p.bot_holders_pct}% > ${config.screening.maxBotHoldersPct}%`);
+        return false;
+      }
+      if (p.bundle_pct != null && config.screening.maxBundlePct != null && p.bundle_pct > config.screening.maxBundlePct) {
+        log("screening", `Bundle filter: dropped ${p.name} — bundle ${p.bundle_pct}% > ${config.screening.maxBundlePct}%`);
+        return false;
+      }
+      return true;
+    });
+    eligible.splice(0, eligible.length, ...deterministicFiltered);
   }
 
+  const totalEligible = eligible.length;
+
   return {
-    candidates: eligible,
+    candidates: eligible.slice(0, limit),
+    total_eligible: totalEligible,
     total_screened: pools.length,
   };
 }

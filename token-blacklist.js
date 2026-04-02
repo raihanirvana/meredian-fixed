@@ -7,8 +7,11 @@
 
 import fs from "fs";
 import { log } from "./logger.js";
+import { TOKEN_BLACKLIST_FILE, ensureMeridianDir } from "./paths.js";
 
-const BLACKLIST_FILE = "./token-blacklist.json";
+ensureMeridianDir();
+
+const BLACKLIST_FILE = TOKEN_BLACKLIST_FILE;
 
 function load() {
   if (!fs.existsSync(BLACKLIST_FILE)) return {};

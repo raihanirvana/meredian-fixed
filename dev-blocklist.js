@@ -8,8 +8,11 @@
 
 import fs from "fs";
 import { log } from "./logger.js";
+import { DEV_BLOCKLIST_FILE, ensureMeridianDir } from "./paths.js";
 
-const BLOCKLIST_FILE = "./dev-blocklist.json";
+ensureMeridianDir();
+
+const BLOCKLIST_FILE = DEV_BLOCKLIST_FILE;
 
 function load() {
   if (!fs.existsSync(BLOCKLIST_FILE)) return {};

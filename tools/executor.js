@@ -22,14 +22,13 @@ import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsO
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
 import { config, reloadScreeningThresholds } from "../config.js";
 import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
-import { execSync, spawn } from "child_process";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const USER_CONFIG_PATH = path.join(__dirname, "../user-config.json");
+import { exec, spawn } from "child_process";
+import { promisify } from "util";
+import { USER_CONFIG_PATH } from "../paths.js";
 import { log, logAction } from "../logger.js";
 import { notifyDeploy, notifyClose, notifySwap } from "../telegram.js";
+
+const execAsync = promisify(exec);
 
 // Registered by index.js so update_config can restart cron jobs when intervals change
 let _cronRestarter = null;
@@ -66,7 +65,8 @@ const toolMap = {
   },
   self_update: async () => {
     try {
-      const result = execSync("git pull", { cwd: process.cwd(), encoding: "utf8" }).trim();
+      const { stdout, stderr } = await execAsync("git pull", { cwd: process.cwd() });
+      const result = `${stdout || ""}${stderr || ""}`.trim();
       if (result.includes("Already up to date")) {
         return { success: true, updated: false, message: "Already up to date — no restart needed." };
       }
@@ -154,7 +154,7 @@ const toolMap = {
       autoSwapAfterClaim: ["management", "autoSwapAfterClaim"],
       outOfRangeBinsToClose: ["management", "outOfRangeBinsToClose"],
       outOfRangeWaitMinutes: ["management", "outOfRangeWaitMinutes"],
-      minVolumeToRebalance: ["management", "minVolumeToRebalance"],
+      minAgeBeforeYieldCheck: ["management", "minAgeBeforeYieldCheck"],
       stopLossPct: ["management", "stopLossPct"],
       takeProfitFeePct: ["management", "takeProfitFeePct"],
       trailingTakeProfit: ["management", "trailingTakeProfit"],
@@ -171,6 +171,7 @@ const toolMap = {
       // schedule
       managementIntervalMin: ["schedule", "managementIntervalMin"],
       screeningIntervalMin: ["schedule", "screeningIntervalMin"],
+      healthCheckIntervalMin: ["schedule", "healthCheckIntervalMin"],
       // models
       managementModel: ["llm", "managementModel"],
       screeningModel: ["llm", "screeningModel"],
@@ -209,14 +210,17 @@ const toolMap = {
     // Persist to user-config.json
     let userConfig = {};
     if (fs.existsSync(USER_CONFIG_PATH)) {
-      try { userConfig = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8")); } catch { /**/ }
+      try { userConfig = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8").replace(/^\uFEFF/, "")); } catch { /**/ }
     }
     Object.assign(userConfig, applied);
     userConfig._lastAgentTune = new Date().toISOString();
     fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(userConfig, null, 2));
 
     // Restart cron jobs if intervals changed
-    const intervalChanged = applied.managementIntervalMin != null || applied.screeningIntervalMin != null;
+    const intervalChanged =
+      applied.managementIntervalMin != null ||
+      applied.screeningIntervalMin != null ||
+      applied.healthCheckIntervalMin != null;
     if (intervalChanged && _cronRestarter) {
       _cronRestarter();
       log("config", `Cron restarted — management: ${config.schedule.managementIntervalMin}m, screening: ${config.schedule.screeningIntervalMin}m`);
@@ -277,6 +281,15 @@ export async function executeTool(name, args) {
 
   // ─── Execute ──────────────────────────────
   try {
+    let preExecutionBalances = null;
+    if (name === "close_position" || (name === "claim_fees" && config.management.autoSwapAfterClaim)) {
+      try {
+        preExecutionBalances = await getWalletBalances({});
+      } catch {
+        preExecutionBalances = null;
+      }
+    }
+
     const result = await fn(args);
     const duration = Date.now() - startTime;
     const success = result?.success !== false && !result?.error;
@@ -306,13 +319,18 @@ export async function executeTool(name, args) {
           try {
             const balances = await getWalletBalances({});
             const token = balances.tokens?.find(t => t.mint === result.base_mint);
-            if (token && token.usd >= 0.10) {
-              log("executor", `Auto-swapping ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`);
-              const swapResult = await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: token.balance });
+            const preToken = preExecutionBalances?.tokens?.find(t => t.mint === result.base_mint);
+            const deltaBalance = Math.max(0, (token?.balance || 0) - (preToken?.balance || 0));
+            const deltaUsd = Math.max(0, (token?.usd || 0) - (preToken?.usd || 0));
+            if (token && deltaBalance > 0 && deltaUsd >= 0.10) {
+              log("executor", `Auto-swapping received ${token.symbol || result.base_mint.slice(0, 8)} ($${deltaUsd.toFixed(2)}) back to SOL`);
+              const swapResult = await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: deltaBalance });
               // Tell the model the swap already happened so it doesn't call swap_token again
               result.auto_swapped = true;
               result.auto_swap_note = `Base token already auto-swapped back to SOL (${token.symbol || result.base_mint.slice(0, 8)} → SOL). Do NOT call swap_token again.`;
               if (swapResult?.amount_out) result.sol_received = swapResult.amount_out;
+            } else if (token && token.usd >= 0.10) {
+              log("executor", `Skipping auto-swap for ${token.symbol || result.base_mint.slice(0, 8)} - no fresh token delta detected`);
             }
           } catch (e) {
             log("executor_warn", `Auto-swap after close failed: ${e.message}`);
@@ -322,9 +340,14 @@ export async function executeTool(name, args) {
         try {
           const balances = await getWalletBalances({});
           const token = balances.tokens?.find(t => t.mint === result.base_mint);
-          if (token && token.usd >= 0.10) {
-            log("executor", `Auto-swapping claimed ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`);
-            await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: token.balance });
+          const preToken = preExecutionBalances?.tokens?.find(t => t.mint === result.base_mint);
+          const deltaBalance = Math.max(0, (token?.balance || 0) - (preToken?.balance || 0));
+          const deltaUsd = Math.max(0, (token?.usd || 0) - (preToken?.usd || 0));
+          if (token && deltaBalance > 0 && deltaUsd >= 0.10) {
+            log("executor", `Auto-swapping claimed ${token.symbol || result.base_mint.slice(0, 8)} ($${deltaUsd.toFixed(2)}) back to SOL`);
+            await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: deltaBalance });
+          } else if (token && token.usd >= 0.10) {
+            log("executor", `Skipping auto-swap after claim for ${token.symbol || result.base_mint.slice(0, 8)} - no fresh token delta detected`);
           }
         } catch (e) {
           log("executor_warn", `Auto-swap after claim failed: ${e.message}`);

@@ -1,9 +1,9 @@
 import fs from "fs";
 import { log } from "./logger.js";
 import { getPerformanceSummary } from "./lessons.js";
+import { LESSONS_FILE, STATE_FILE, ensureMeridianDir } from "./paths.js";
 
-const STATE_FILE = "./state.json";
-const LESSONS_FILE = "./lessons.json";
+ensureMeridianDir();
 
 export async function generateBriefing() {
   const state = loadJson(STATE_FILE) || { positions: {}, recentEvents: [] };

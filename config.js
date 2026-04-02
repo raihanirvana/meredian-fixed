@@ -1,17 +1,17 @@
 import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
+import { config as loadDotenv } from "dotenv";
+import { ENV_PATH, USER_CONFIG_PATH, ensureMeridianDir } from "./paths.js";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
+ensureMeridianDir();
+loadDotenv({ path: ENV_PATH, override: false, quiet: true });
 
 const u = fs.existsSync(USER_CONFIG_PATH)
-  ? JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"))
+  ? JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8").replace(/^\uFEFF/, ""))
   : {};
+const DEFAULT_MODEL = process.env.LLM_MODEL || "openai/gpt-oss-20b:free";
 
-// Apply wallet/RPC from user-config if not already in env
+// Apply non-secret runtime overrides from user-config if not already in env
 if (u.rpcUrl)    process.env.RPC_URL            ||= u.rpcUrl;
-if (u.walletKey) process.env.WALLET_PRIVATE_KEY ||= u.walletKey;
 if (u.llmModel)  process.env.LLM_MODEL          ||= u.llmModel;
 if (u.llmBaseUrl) process.env.LLM_BASE_URL      ||= u.llmBaseUrl;
 if (u.llmApiKey)  process.env.LLM_API_KEY       ||= u.llmApiKey;
@@ -54,7 +54,6 @@ export const config = {
     autoSwapAfterClaim:    u.autoSwapAfterClaim    ?? false,
     outOfRangeBinsToClose: u.outOfRangeBinsToClose ?? 10,
     outOfRangeWaitMinutes: u.outOfRangeWaitMinutes ?? 30,
-    minVolumeToRebalance:  u.minVolumeToRebalance  ?? 1000,
     stopLossPct:           u.stopLossPct           ?? u.emergencyPriceDropPct ?? -50,
     takeProfitFeePct:      u.takeProfitFeePct      ?? 5,
     minFeePerTvl24h:       u.minFeePerTvl24h       ?? 7,
@@ -89,9 +88,9 @@ export const config = {
     temperature: u.temperature ?? 0.373,
     maxTokens:   u.maxTokens   ?? 4096,
     maxSteps:    u.maxSteps    ?? 20,
-    managementModel: u.managementModel ?? process.env.LLM_MODEL ?? "openrouter/healer-alpha",
-    screeningModel:  u.screeningModel  ?? process.env.LLM_MODEL ?? "openrouter/hunter-alpha",
-    generalModel:    u.generalModel    ?? process.env.LLM_MODEL ?? "openrouter/healer-alpha",
+    managementModel: u.managementModel ?? DEFAULT_MODEL,
+    screeningModel:  u.screeningModel  ?? DEFAULT_MODEL,
+    generalModel:    u.generalModel    ?? DEFAULT_MODEL,
   },
 
   // ─── Common Token Mints ────────────────
@@ -150,7 +149,10 @@ export function reloadScreeningThresholds() {
     if (fresh.minTokenAgeHours  !== undefined) s.minTokenAgeHours = fresh.minTokenAgeHours;
     if (fresh.maxTokenAgeHours  !== undefined) s.maxTokenAgeHours = fresh.maxTokenAgeHours;
     if (fresh.athFilterPct      !== undefined) s.athFilterPct     = fresh.athFilterPct;
+    if (fresh.minTokenFeesSol   != null) s.minTokenFeesSol   = fresh.minTokenFeesSol;
     if (fresh.maxBundlePct      != null) s.maxBundlePct     = fresh.maxBundlePct;
     if (fresh.maxBotHoldersPct  != null) s.maxBotHoldersPct = fresh.maxBotHoldersPct;
+    if (fresh.maxTop10Pct       != null) s.maxTop10Pct      = fresh.maxTop10Pct;
+    if (fresh.blockedLaunchpads != null) s.blockedLaunchpads = fresh.blockedLaunchpads;
   } catch { /* ignore */ }
 }

@@ -19,7 +19,7 @@ import { getTokenNarrative, getTokenInfo } from "./tools/token.js";
 
 log("startup", "DLMM LP Agent starting...");
 log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
-log("startup", `Model: ${process.env.LLM_MODEL || "hermes-3-405b"}`);
+log("startup", `Model: ${config.llm.generalModel}`);
 
 const TP_PCT = config.management.takeProfitFeePct;
 const DEPLOY = config.management.deployAmountSol;
@@ -194,7 +194,7 @@ export async function runManagementCycle({ silent = false } = {}) {
       // Rule 5: fee yield too low
       if (p.fee_per_tvl_24h != null &&
           p.fee_per_tvl_24h < config.management.minFeePerTvl24h &&
-          (p.age_minutes ?? 0) >= 60) {
+          (p.age_minutes ?? 0) >= config.management.minAgeBeforeYieldCheck) {
         actionMap.set(p.position, { action: "CLOSE", rule: 5, reason: "low yield" });
         continue;
       }
@@ -305,6 +305,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
   }
   _screeningBusy = true; // set immediately — prevents TOCTOU race with concurrent callers
   _screeningLastTriggered = Date.now();
+  timers.screeningLastRun = Date.now();
 
   // Hard guards — don't even run the agent if preconditions aren't met
   let prePositions, preBalance;
@@ -326,7 +327,6 @@ export async function runScreeningCycle({ silent = false } = {}) {
     _screeningBusy = false;
     return null;
   }
-  timers.screeningLastRun = Date.now();
   log("cron", `Starting screening cycle [model: ${config.llm.screeningModel}]`);
   let screenReport = null;
   try {
@@ -365,22 +365,36 @@ export async function runScreeningCycle({ silent = false } = {}) {
 
     // Hard filters after token recon — block launchpads and excessive Jupiter bot holders
     const passing = allCandidates.filter(({ pool, ti }) => {
-      const launchpad = ti?.launchpad ?? null;
+      const launchpad = ti?.launchpad ?? pool.launchpad ?? null;
       if (launchpad && config.screening.blockedLaunchpads.includes(launchpad)) {
         log("screening", `Skipping ${pool.name} — blocked launchpad (${launchpad})`);
         return false;
       }
-      const botPct = ti?.audit?.bot_holders_pct;
+      const feesSol = ti?.global_fees_sol ?? pool.global_fees_sol ?? null;
+      if (feesSol != null && config.screening.minTokenFeesSol != null && feesSol < config.screening.minTokenFeesSol) {
+        log("screening", `Fees filter: dropped ${pool.name} — fees ${feesSol} SOL < ${config.screening.minTokenFeesSol} SOL`);
+        return false;
+      }
+      const top10Pct = ti?.audit?.top_holders_pct != null ? Number(ti.audit.top_holders_pct) : pool.top_10_pct;
+      if (top10Pct != null && config.screening.maxTop10Pct != null && top10Pct > config.screening.maxTop10Pct) {
+        log("screening", `Top10 filter: dropped ${pool.name} — top10 ${top10Pct}% > ${config.screening.maxTop10Pct}%`);
+        return false;
+      }
+      const botPct = ti?.audit?.bot_holders_pct != null ? Number(ti.audit.bot_holders_pct) : pool.bot_holders_pct;
       const maxBotHoldersPct = config.screening.maxBotHoldersPct;
       if (botPct != null && maxBotHoldersPct != null && botPct > maxBotHoldersPct) {
         log("screening", `Bot-holder filter: dropped ${pool.name} — bots ${botPct}% > ${maxBotHoldersPct}%`);
+        return false;
+      }
+      if (pool.bundle_pct != null && config.screening.maxBundlePct != null && pool.bundle_pct > config.screening.maxBundlePct) {
+        log("screening", `Bundle filter: dropped ${pool.name} — bundle ${pool.bundle_pct}% > ${config.screening.maxBundlePct}%`);
         return false;
       }
       return true;
     });
 
     if (passing.length === 0) {
-      screenReport = `No candidates available (all blocked by launchpad filter).`;
+      screenReport = `No candidates available after deterministic filters (fees/holders/bundle/launchpad).`;
       return screenReport;
     }
 
@@ -393,7 +407,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     const candidateBlocks = passing.map(({ pool, sw, n, ti, mem }, i) => {
       const botPct = ti?.audit?.bot_holders_pct ?? "?";
       const top10Pct = ti?.audit?.top_holders_pct ?? "?";
-      const feesSol = ti?.global_fees_sol ?? "?";
+      const feesSol = ti?.global_fees_sol ?? pool.global_fees_sol ?? "?";
       const launchpad = ti?.launchpad ?? null;
       const priceChange = ti?.stats_1h?.price_change;
       const netBuyers = ti?.stats_1h?.net_buyers;
@@ -489,7 +503,8 @@ export function startCronJobs() {
 
   const screenTask = cron.schedule(`*/${Math.max(1, config.schedule.screeningIntervalMin)} * * * *`, runScreeningCycle);
 
-  const healthTask = cron.schedule(`0 * * * *`, async () => {
+  const healthEvery = Math.max(1, config.schedule.healthCheckIntervalMin);
+  const healthTask = cron.schedule(`*/${healthEvery} * * * *`, async () => {
     if (_managementBusy) return;
     _managementBusy = true;
     log("cron", "Starting health check");
@@ -972,7 +987,8 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
           return;
         }
         const fs = await import("fs");
-        const lessonsData = JSON.parse(fs.default.readFileSync("./lessons.json", "utf8"));
+        const { LESSONS_FILE } = await import("./paths.js");
+        const lessonsData = JSON.parse(fs.default.readFileSync(LESSONS_FILE, "utf8"));
         const result = evolveThresholds(lessonsData.performance, config);
         if (!result || Object.keys(result.changes).length === 0) {
           console.log("\nNo threshold changes needed — current settings already match performance data.\n");

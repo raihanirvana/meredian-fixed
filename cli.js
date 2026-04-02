@@ -3,12 +3,11 @@
  * meridian — Solana DLMM LP Agent CLI
  * Direct tool invocation with JSON output. Agent-native.
  */
-
-import "dotenv/config";
 import { parseArgs } from "util";
 import os from "os";
 import fs from "fs";
 import path from "path";
+import { DISCORD_SIGNALS_FILE, LESSONS_FILE } from "./paths.js";
 
 // ─── DRY_RUN must be set before any tool imports ─────────────────
 if (process.argv.includes("--dry-run")) process.env.DRY_RUN = "true";
@@ -18,7 +17,7 @@ const meridianDir = path.join(os.homedir(), ".meridian");
 const meridianEnv = path.join(meridianDir, ".env");
 if (fs.existsSync(meridianEnv)) {
   const { config: loadDotenv } = await import("dotenv");
-  loadDotenv({ path: meridianEnv, override: false });
+  loadDotenv({ path: meridianEnv, override: false, quiet: true });
 }
 
 // ─── Output helpers ───────────────────────────────────────────────
@@ -212,7 +211,11 @@ Starts the autonomous agent with cron jobs (management + screening).
 `;
 
 fs.mkdirSync(meridianDir, { recursive: true });
-fs.writeFileSync(path.join(meridianDir, "SKILL.md"), SKILL_MD);
+try {
+  fs.writeFileSync(path.join(meridianDir, "SKILL.md"), SKILL_MD);
+} catch {
+  // CLI should still work even if helper docs can't be refreshed.
+}
 
 // ─── Parse args ───────────────────────────────────────────────────
 const argv = process.argv.slice(2);
@@ -559,7 +562,7 @@ switch (subcommand) {
     const { config } = await import("./config.js");
     const { evolveThresholds } = await import("./lessons.js");
     const fs2 = await import("fs");
-    const lessonsFile = "./lessons.json";
+    const lessonsFile = LESSONS_FILE;
     let perfData = [];
     if (fs2.existsSync(lessonsFile)) {
       try { perfData = JSON.parse(fs2.readFileSync(lessonsFile, "utf8")).performance || []; } catch { /* no data */ }
@@ -601,7 +604,7 @@ switch (subcommand) {
 
   // ── discord-signals ──────────────────────────────────────────────
   case "discord-signals": {
-    const sigFile = path.join(process.cwd(), "discord-signals.json");
+    const sigFile = DISCORD_SIGNALS_FILE;
     if (!fs.existsSync(sigFile)) {
       out({ count: 0, pending: 0, signals: [], message: "No discord-signals.json found. Is the listener running?" });
       break;

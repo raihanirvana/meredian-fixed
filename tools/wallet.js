@@ -12,6 +12,23 @@ import { config } from "../config.js";
 let _connection = null;
 let _wallet = null;
 
+export function parseWalletPrivateKey(rawKey) {
+  const value = String(rawKey || "").trim();
+  if (!value) {
+    throw new Error("WALLET_PRIVATE_KEY not set");
+  }
+
+  if (value.startsWith("[")) {
+    const parsed = JSON.parse(value);
+    if (!Array.isArray(parsed) || parsed.length === 0) {
+      throw new Error("WALLET_PRIVATE_KEY JSON array is empty or invalid");
+    }
+    return Uint8Array.from(parsed);
+  }
+
+  return bs58.decode(value);
+}
+
 function getConnection() {
   if (!_connection) _connection = new Connection(process.env.RPC_URL, "confirmed");
   return _connection;
@@ -20,7 +37,7 @@ function getConnection() {
 function getWallet() {
   if (!_wallet) {
     if (!process.env.WALLET_PRIVATE_KEY) throw new Error("WALLET_PRIVATE_KEY not set");
-    _wallet = Keypair.fromSecretKey(bs58.decode(process.env.WALLET_PRIVATE_KEY));
+    _wallet = Keypair.fromSecretKey(parseWalletPrivateKey(process.env.WALLET_PRIVATE_KEY));
   }
   return _wallet;
 }
@@ -28,7 +45,14 @@ function getWallet() {
 const JUPITER_PRICE_API = "https://api.jup.ag/price/v3";
 const JUPITER_ULTRA_API = "https://api.jup.ag/ultra/v1";
 const JUPITER_QUOTE_API = "https://api.jup.ag/swap/v1";
-const JUPITER_API_KEY = "b15d42e9-e0e4-4f90-a424-ae41ceeaa382";
+const JUPITER_API_KEY = process.env.JUPITER_API_KEY || process.env.JUP_API_KEY || "";
+const SOL_MINT = "So11111111111111111111111111111111111111112";
+
+function buildJupiterHeaders(extra = {}) {
+  return JUPITER_API_KEY
+    ? { ...extra, "x-api-key": JUPITER_API_KEY }
+    : extra;
+}
 
 /**
  * Get current wallet balances: SOL, USDC, and all SPL tokens using Helius Wallet API.
@@ -103,21 +127,18 @@ export async function getWalletBalances() {
 /**
  * Swap tokens via Jupiter Ultra API (order → sign → execute).
  */
-const SOL_MINT = "So11111111111111111111111111111111111111112";
-
-// Normalize any SOL-like address to the correct wrapped SOL mint
+// Only normalize explicit SOL aliases. Never rewrite arbitrary base58-like strings.
 export function normalizeMint(mint) {
   if (!mint) return mint;
-  const SOL_MINT = "So11111111111111111111111111111111111111112";
-  if (
-    mint === "SOL" || 
-    mint === "native" || 
-    /^So1+$/.test(mint) || 
-    (mint.length >= 32 && mint.length <= 44 && mint.startsWith("So1") && mint !== SOL_MINT)
-  ) {
+  const value = String(mint).trim();
+  if (!value) return value;
+
+  const alias = value.toLowerCase();
+  if (value === SOL_MINT || alias === "sol" || alias === "native" || alias === "wsol") {
     return SOL_MINT;
   }
-  return mint;
+
+  return value;
 }
 
 export async function swapToken({
@@ -158,7 +179,7 @@ export async function swapToken({
       `&taker=${wallet.publicKey.toString()}`;
 
     const orderRes = await fetch(orderUrl, {
-      headers: { "x-api-key": JUPITER_API_KEY },
+      headers: buildJupiterHeaders(),
     });
     if (!orderRes.ok) {
       const body = await orderRes.text();
@@ -185,10 +206,7 @@ export async function swapToken({
     // ─── Execute ───────────────────────────────────────────────
     const execRes = await fetch(`${JUPITER_ULTRA_API}/execute`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": JUPITER_API_KEY,
-      },
+      headers: buildJupiterHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ signedTransaction: signedTx, requestId }),
     });
     if (!execRes.ok) {
@@ -220,7 +238,7 @@ async function swapViaQuoteApi({ wallet, connection, input_mint, output_mint, am
   // ─── Get quote ─────────────────────────────────────────────
   const quoteRes = await fetch(
     `${JUPITER_QUOTE_API}/quote?inputMint=${input_mint}&outputMint=${output_mint}&amount=${amountStr}&slippageBps=300`,
-    { headers: { "x-api-key": JUPITER_API_KEY } }
+    { headers: buildJupiterHeaders() }
   );
   if (!quoteRes.ok) throw new Error(`Quote failed: ${quoteRes.status} ${await quoteRes.text()}`);
   const quote = await quoteRes.json();
@@ -229,7 +247,7 @@ async function swapViaQuoteApi({ wallet, connection, input_mint, output_mint, am
   // ─── Get swap tx ───────────────────────────────────────────
   const swapRes = await fetch(`${JUPITER_QUOTE_API}/swap`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "x-api-key": JUPITER_API_KEY },
+    headers: buildJupiterHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify({
       quoteResponse: quote,
       userPublicKey: wallet.publicKey.toString(),

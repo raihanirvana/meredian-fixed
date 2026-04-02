@@ -11,20 +11,17 @@
  */
 import { Client } from "discord.js-selfbot-v13";
 import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
 import { createRequire } from "module";
+import { DISCORD_SIGNALS_FILE, ENV_PATH, ensureMeridianDir } from "../paths.js";
 
-// Load .env from parent directory (meridian root)
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const ROOT = path.resolve(__dirname, "..");
 const require = createRequire(import.meta.url);
 const dotenv = require("dotenv");
-dotenv.config({ path: path.join(ROOT, ".env") });
+ensureMeridianDir();
+dotenv.config({ path: ENV_PATH, override: false, quiet: true });
 
 import { runPreChecks } from "./pre-checks.js";
 
-const SIGNALS_FILE = path.join(ROOT, "discord-signals.json");
+const SIGNALS_FILE = DISCORD_SIGNALS_FILE;
 
 // Solana address regex: base58, 32-44 chars
 const SOL_ADDR_RE = /[1-9A-HJ-NP-Za-km-z]{32,44}/g;

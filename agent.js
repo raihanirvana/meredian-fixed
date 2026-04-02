@@ -68,16 +68,31 @@ import { log } from "./logger.js";
 import { config } from "./config.js";
 import { getStateSummary } from "./state.js";
 import { getLessonsForPrompt, getPerformanceSummary } from "./lessons.js";
+import { ENV_PATH } from "./paths.js";
 
 // Supports OpenRouter (default) or any OpenAI-compatible local server (e.g. LM Studio)
 // To use LM Studio: set LLM_BASE_URL=http://localhost:1234/v1 and LLM_API_KEY=lm-studio in .env
-const client = new OpenAI({
-  baseURL: process.env.LLM_BASE_URL || "https://openrouter.ai/api/v1",
-  apiKey: process.env.LLM_API_KEY || process.env.OPENROUTER_API_KEY,
-  timeout: 5 * 60 * 1000,
-});
+let client = null;
 
-const DEFAULT_MODEL = process.env.LLM_MODEL || "openrouter/healer-alpha";
+function getClient() {
+  if (client) return client;
+
+  const apiKey = process.env.LLM_API_KEY || process.env.OPENROUTER_API_KEY || process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    throw new Error(
+      `LLM API key is missing. Add LLM_API_KEY (or OPENROUTER_API_KEY / OPENAI_API_KEY) to ${ENV_PATH}.`
+    );
+  }
+
+  client = new OpenAI({
+    baseURL: process.env.LLM_BASE_URL || "https://openrouter.ai/api/v1",
+    apiKey,
+    timeout: 5 * 60 * 1000,
+  });
+  return client;
+}
+
+const DEFAULT_MODEL = config.llm.generalModel;
 
 const TOOL_REQUIRED_INTENTS = /\b(deploy|open position|open|add liquidity|lp into|invest in|close|exit|withdraw|remove liquidity|claim|harvest|collect|swap|convert|sell|exchange|block|unblock|blacklist|self.?update|pull latest|git pull|update yourself|config|setting|threshold|set |change|update |balance|wallet|position|portfolio|pnl|yield|range|screen|candidate|find pool|search|research|token|smart wallet|whale|watch.?list|tracked wallet|study top|top lpers?|lp behavior|who.?s lping|performance|history|stats|report|lesson|learned|teach|pin|unpin)\b/i;
 
@@ -135,7 +150,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       const toolChoice = (step === 0 && (ACTION_INTENTS.test(goal) || mustUseRealTool)) ? "required" : "auto";
 
       for (let attempt = 0; attempt < 3; attempt++) {
-        response = await client.chat.completions.create({
+        response = await getClient().chat.completions.create({
           model: usedModel,
           messages,
           tools: getToolsForRole(agentType, goal),
