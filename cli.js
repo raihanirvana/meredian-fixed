@@ -4,20 +4,16 @@
  * Direct tool invocation with JSON output. Agent-native.
  */
 import { parseArgs } from "util";
-import os from "os";
 import fs from "fs";
-import path from "path";
-import { DISCORD_SIGNALS_FILE, LESSONS_FILE } from "./paths.js";
+import { config as loadDotenv } from "dotenv";
+import { DISCORD_SIGNALS_FILE, ENV_PATH, LESSONS_FILE, MERIDIAN_DIR } from "./paths.js";
 
 // ─── DRY_RUN must be set before any tool imports ─────────────────
 if (process.argv.includes("--dry-run")) process.env.DRY_RUN = "true";
 
 // ─── Load .env from ~/.meridian/ if present ──────────────────────
-const meridianDir = path.join(os.homedir(), ".meridian");
-const meridianEnv = path.join(meridianDir, ".env");
-if (fs.existsSync(meridianEnv)) {
-  const { config: loadDotenv } = await import("dotenv");
-  loadDotenv({ path: meridianEnv, override: false, quiet: true });
+if (fs.existsSync(ENV_PATH)) {
+  loadDotenv({ path: ENV_PATH, override: false, quiet: true });
 }
 
 // ─── Output helpers ───────────────────────────────────────────────
@@ -210,9 +206,9 @@ Starts the autonomous agent with cron jobs (management + screening).
 --silent      Suppress Telegram notifications for this run
 `;
 
-fs.mkdirSync(meridianDir, { recursive: true });
+fs.mkdirSync(MERIDIAN_DIR, { recursive: true });
 try {
-  fs.writeFileSync(path.join(meridianDir, "SKILL.md"), SKILL_MD);
+  fs.writeFileSync(path.join(MERIDIAN_DIR, "SKILL.md"), SKILL_MD);
 } catch {
   // CLI should still work even if helper docs can't be refreshed.
 }

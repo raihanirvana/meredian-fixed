@@ -14,6 +14,7 @@ export const POOL_MEMORY_FILE = path.join(MERIDIAN_DIR, "pool-memory.json");
 export const STRATEGY_LIBRARY_FILE = path.join(MERIDIAN_DIR, "strategy-library.json");
 export const SMART_WALLETS_FILE = path.join(MERIDIAN_DIR, "smart-wallets.json");
 export const DISCORD_SIGNALS_FILE = path.join(MERIDIAN_DIR, "discord-signals.json");
+export const SIGNAL_WEIGHTS_FILE = path.join(MERIDIAN_DIR, "signal-weights.json");
 
 export function ensureMeridianDir() {
   if (!fs.existsSync(MERIDIAN_DIR)) {

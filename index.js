@@ -1,6 +1,7 @@
-import "dotenv/config";
 import cron from "node-cron";
 import readline from "readline";
+import { config as loadDotenv } from "dotenv";
+import { ENV_PATH } from "./paths.js";
 import { agentLoop } from "./agent.js";
 import { log } from "./logger.js";
 import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
@@ -16,6 +17,8 @@ import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
 import { getTokenNarrative, getTokenInfo } from "./tools/token.js";
+
+loadDotenv({ path: ENV_PATH, override: true, quiet: true });
 
 log("startup", "DLMM LP Agent starting...");
 log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);

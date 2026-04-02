@@ -11,8 +11,11 @@
 
 import fs from "fs";
 import { log } from "./logger.js";
+import { SIGNAL_WEIGHTS_FILE, ensureMeridianDir } from "./paths.js";
 
-const WEIGHTS_FILE = "./signal-weights.json";
+ensureMeridianDir();
+
+const WEIGHTS_FILE = SIGNAL_WEIGHTS_FILE;
 
 // ─── Signal Definitions ─────────────────────────────────────────
 
