@@ -11,6 +11,8 @@ import {
   trackPosition,
   recordClaim,
   recordClose,
+  recordLiquidityAdded,
+  recordLiquidityRemoved,
   getTrackedPosition,
   minutesOutOfRange,
   syncOpenPositions,
@@ -141,13 +143,7 @@ export async function deployPosition({
   const minBinId = activeBin.binId - activeBinsBelow;
   const maxBinId = activeBin.binId + activeBinsAbove;
 
-  const strategyMap = {
-    spot: StrategyType.Spot,
-    curve: StrategyType.Curve,
-    bid_ask: StrategyType.BidAsk,
-  };
-
-  const strategyType = strategyMap[activeStrategy];
+  const strategyType = resolveStrategyType(activeStrategy, StrategyType);
   if (strategyType === undefined) {
     throw new Error(`Invalid strategy: ${activeStrategy}. Use spot, curve, or bid_ask.`);
   }
@@ -277,6 +273,104 @@ export async function deployPosition({
     log("deploy_error", error.message);
     return { success: false, error: error.message };
   }
+}
+
+// ─── Add Liquidity To Existing Position ───────────────────────
+export async function addLiquidity({
+  position_address,
+  pool_address,
+  amount_x = 0,
+  amount_y,
+  amount_sol,
+  strategy,
+  bins_below,
+  bins_above,
+}) {
+  if (process.env.DRY_RUN === "true") {
+    return {
+      dry_run: true,
+      would_add_liquidity: {
+        position_address,
+        pool_address,
+        amount_x,
+        amount_y: amount_y ?? amount_sol ?? 0,
+      },
+      message: "DRY RUN — no transaction sent",
+    };
+  }
+
+  const tracked = getTrackedPosition(position_address);
+  const wallet = getWallet();
+  const resolvedPoolAddress = pool_address || await lookupPoolForPosition(position_address, wallet.publicKey.toString());
+  const pool = await getPool(resolvedPoolAddress);
+  const positionPubKey = new PublicKey(position_address);
+  const { StrategyType } = await getDLMM();
+
+  const trackedBinsBelow = tracked?.bin_range?.bins_below;
+  const trackedBinsAbove = tracked?.bin_range?.bins_above;
+  const lowerBinId = tracked?.bin_range?.min;
+  const upperBinId = tracked?.bin_range?.max;
+
+  let minBinId = lowerBinId;
+  let maxBinId = upperBinId;
+  if (minBinId == null || maxBinId == null) {
+    const posData = await pool.getPosition(positionPubKey);
+    if (posData?.positionData) {
+      minBinId = posData.positionData.lowerBinId;
+      maxBinId = posData.positionData.upperBinId;
+    }
+  }
+  if (minBinId == null || maxBinId == null) {
+    throw new Error("Could not resolve position bin range for add-liquidity");
+  }
+
+  const finalAmountY = amount_y ?? amount_sol ?? 0;
+  if (finalAmountY <= 0 && (amount_x ?? 0) <= 0) {
+    throw new Error("add-liquidity requires a positive amount_x or amount_y");
+  }
+
+  const activeStrategy = strategy || tracked?.strategy || config.strategy.strategy;
+  const strategyType = resolveStrategyType(activeStrategy, StrategyType);
+  if (strategyType === undefined) {
+    throw new Error(`Invalid strategy: ${activeStrategy}. Use spot, curve, or bid_ask.`);
+  }
+
+  const totalYLamports = new BN(Math.floor(finalAmountY * 1e9));
+  let totalXLamports = new BN(0);
+  if (amount_x > 0) {
+    const mintInfo = await getConnection().getParsedAccountInfo(new PublicKey(pool.lbPair.tokenXMint));
+    const decimals = mintInfo.value?.data?.parsed?.info?.decimals ?? 9;
+    totalXLamports = new BN(Math.floor(amount_x * Math.pow(10, decimals)));
+  }
+
+  const tx = await pool.addLiquidityByStrategy({
+    positionPubKey,
+    user: wallet.publicKey,
+    totalXAmount: totalXLamports,
+    totalYAmount: totalYLamports,
+    strategy: {
+      minBinId: minBinId ?? inferMinBinIdFromWidth(pool, trackedBinsBelow, trackedBinsAbove),
+      maxBinId: maxBinId ?? inferMaxBinIdFromWidth(pool, trackedBinsBelow, trackedBinsAbove),
+      strategyType,
+    },
+    slippage: 1000,
+  });
+
+  const txHashes = [];
+  for (const pendingTx of Array.isArray(tx) ? tx : [tx]) {
+    txHashes.push(await sendAndConfirmTransaction(getConnection(), pendingTx, [wallet]));
+  }
+  _positionsCacheAt = 0;
+  recordLiquidityAdded(position_address, finalAmountY, amount_x);
+
+  return {
+    success: true,
+    position: position_address,
+    pool: resolvedPoolAddress.toString(),
+    amount_x,
+    amount_y: finalAmountY,
+    txs: txHashes,
+  };
 }
 
 const POSITIONS_CACHE_TTL = 5 * 60_000; // 5 minutes
@@ -542,6 +636,10 @@ export async function claimFees({ position_address }) {
       parseFloat(pnl?.unrealizedPnl?.unclaimedFeeTokenX?.usd || 0) +
       parseFloat(pnl?.unrealizedPnl?.unclaimedFeeTokenY?.usd || 0)
     ) * 100) / 100;
+    const claimedFeesSol = Math.round((
+      parseFloat(pnl?.unrealizedPnl?.unclaimedFeeTokenX?.amountSol || 0) +
+      parseFloat(pnl?.unrealizedPnl?.unclaimedFeeTokenY?.amountSol || 0)
+    ) * 1e6) / 1e6;
 
     const positionData = await pool.getPosition(new PublicKey(position_address));
     const txs = await pool.claimSwapFee({
@@ -562,7 +660,15 @@ export async function claimFees({ position_address }) {
     _positionsCacheAt = 0; // invalidate cache after claim
     recordClaim(position_address, claimedFeesUsd);
 
-    return { success: true, position: position_address, txs: txHashes, base_mint: pool.lbPair.tokenXMint.toString(), claimed_fees_usd: claimedFeesUsd };
+    return {
+      success: true,
+      position: position_address,
+      pool: poolAddress.toString(),
+      txs: txHashes,
+      base_mint: pool.lbPair.tokenXMint.toString(),
+      claimed_fees_usd: claimedFeesUsd,
+      claimed_fees_sol: claimedFeesSol,
+    };
   } catch (error) {
     log("claim_error", error.message);
     return { success: false, error: error.message };
@@ -704,7 +810,9 @@ export async function closePosition({ position_address, reason }) {
 
       // Fetch closed PnL from API — authoritative source after withdrawal settles
       let pnlUsd = 0;
+      let pnlSol = null;
       let pnlPct = 0;
+      let pnlSolPct = null;
       let finalValueUsd = 0;
       let initialUsd = 0;
       let feesUsd = tracked.total_fees_claimed_usd || 0;
@@ -716,7 +824,9 @@ export async function closePosition({ position_address, reason }) {
           const posEntry = (data.positions || []).find(p => p.positionAddress === position_address);
           if (posEntry) {
             pnlUsd        = parseFloat(posEntry.pnlUsd || 0);
+            pnlSol        = posEntry.pnlSol != null ? parseFloat(posEntry.pnlSol) : null;
             pnlPct        = parseFloat(posEntry.pnlPctChange || 0);
+            pnlSolPct     = posEntry.pnlSolPctChange != null ? parseFloat(posEntry.pnlSolPctChange) : null;
             finalValueUsd = parseFloat(posEntry.allTimeWithdrawals?.total?.usd || 0);
             initialUsd    = parseFloat(posEntry.allTimeDeposits?.total?.usd || 0);
             feesUsd       = parseFloat(posEntry.allTimeFees?.total?.usd || 0) || feesUsd;
@@ -733,6 +843,7 @@ export async function closePosition({ position_address, reason }) {
         const cachedPos = _positionsCache?.positions?.find(p => p.position === position_address);
         if (cachedPos) {
           pnlUsd        = cachedPos.pnl_true_usd ?? cachedPos.pnl_usd ?? 0;
+          pnlSol        = config.management.solMode ? (cachedPos.pnl_usd ?? null) : null;
           pnlPct        = cachedPos.pnl_pct   ?? 0;
           feesUsd       = (cachedPos.collected_fees_true_usd || 0) + (cachedPos.unclaimed_fees_true_usd || 0);
           initialUsd    = tracked.initial_value_usd || 0;
@@ -776,7 +887,9 @@ export async function closePosition({ position_address, reason }) {
         close_txs: closeTxHashes,
         txs: txHashes,
         pnl_usd: pnlUsd,
+        pnl_sol: pnlSol,
         pnl_pct: pnlPct,
+        pnl_sol_pct: pnlSolPct,
         base_mint: pool.lbPair.tokenXMint.toString(),
       };
     }
@@ -797,7 +910,85 @@ export async function closePosition({ position_address, reason }) {
   }
 }
 
+// ─── Partial Close (scale-out) ────────────────────────────────
+export async function partialClosePosition({ position_address, bps }) {
+  if (process.env.DRY_RUN === "true") {
+    return { dry_run: true, would_partial_close: position_address, bps, message: "DRY RUN — no transaction sent" };
+  }
+  const bpsNum = Math.max(1, Math.min(9999, Math.round(bps)));
+  try {
+    log("partial_close", `Partial close ${bpsNum} bps for position: ${position_address}`);
+    const wallet = getWallet();
+    const poolAddress = await lookupPoolForPosition(position_address, wallet.publicKey.toString());
+    poolCache.delete(poolAddress.toString());
+    const pool = await getPool(poolAddress);
+    const positionPubKey = new PublicKey(position_address);
+
+    let fromBinId = -887272;
+    let toBinId = 887272;
+    try {
+      const posData = await pool.getPosition(positionPubKey);
+      if (posData?.positionData) {
+        fromBinId = posData.positionData.lowerBinId ?? fromBinId;
+        toBinId   = posData.positionData.upperBinId ?? toBinId;
+      }
+    } catch (e) {
+      log("partial_close_warn", `Could not read bin range: ${e.message}`);
+    }
+
+    const txs = await pool.removeLiquidity({
+      user: wallet.publicKey,
+      position: positionPubKey,
+      fromBinId,
+      toBinId,
+      bps: new BN(bpsNum),
+      shouldClaimAndClose: false,
+    });
+
+    const txHashes = [];
+    for (const tx of Array.isArray(txs) ? txs : [txs]) {
+      txHashes.push(await sendAndConfirmTransaction(getConnection(), tx, [wallet]));
+    }
+    log("partial_close", `SUCCESS ${bpsNum} bps — txs: ${txHashes.join(", ")}`);
+    _positionsCacheAt = 0;
+    recordLiquidityRemoved(position_address, bpsNum);
+
+    return {
+      success: true,
+      position: position_address,
+      pool: poolAddress.toString(),
+      bps: bpsNum,
+      pct_removed: (bpsNum / 100).toFixed(2),
+      txs: txHashes,
+    };
+  } catch (error) {
+    log("partial_close_error", error.message);
+    return { success: false, error: error.message };
+  }
+}
+
+export async function withdrawLiquidity({ position_address, bps }) {
+  return partialClosePosition({ position_address, bps });
+}
+
 // ─── Helpers ──────────────────────────────────────────────────
+function resolveStrategyType(strategy, StrategyType) {
+  const strategyMap = {
+    spot: StrategyType.Spot,
+    curve: StrategyType.Curve,
+    bid_ask: StrategyType.BidAsk,
+  };
+  return strategyMap[strategy];
+}
+
+function inferMinBinIdFromWidth(pool, binsBelow, binsAbove) {
+  return pool?.lbPair?.activeId != null ? pool.lbPair.activeId - (binsBelow ?? 0) : null;
+}
+
+function inferMaxBinIdFromWidth(pool, binsBelow, binsAbove) {
+  return pool?.lbPair?.activeId != null ? pool.lbPair.activeId + (binsAbove ?? 0) : null;
+}
+
 async function lookupPoolForPosition(position_address, walletAddress) {
   // Check state registry first (fast path)
   const tracked = getTrackedPosition(position_address);

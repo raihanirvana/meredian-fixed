@@ -639,30 +639,24 @@ switch (subcommand) {
 
   // ── withdraw-liquidity ─────────────────────────────────────────
   case "withdraw-liquidity": {
-    if (!flags.position) die("Usage: meridian withdraw-liquidity --position <addr> --pool <addr> [--bps 10000]");
-    if (!flags.pool) die("--pool is required");
+    if (!flags.position) die("Usage: meridian withdraw-liquidity --position <addr> [--bps 10000]");
     const { withdrawLiquidity } = await import("./tools/dlmm.js");
     out(await withdrawLiquidity({
       position_address: flags.position,
-      pool_address: flags.pool,
       bps: flags.bps ? parseInt(flags.bps) : 10000,
-      claim_fees: !argv.includes("--no-claim"),
     }));
     break;
   }
 
   // ── add-liquidity ──────────────────────────────────────────────
   case "add-liquidity": {
-    if (!flags.position) die("Usage: meridian add-liquidity --position <addr> --pool <addr> [--amount-x <n>] [--amount-y <n>]");
-    if (!flags.pool) die("--pool is required");
+    if (!flags.position) die("Usage: meridian add-liquidity --position <addr> [--amount-x <n>] [--amount-y <n>]");
     const { addLiquidity } = await import("./tools/dlmm.js");
     out(await addLiquidity({
       position_address: flags.position,
-      pool_address: flags.pool,
       amount_x: flags["amount-x"] ? parseFloat(flags["amount-x"]) : 0,
       amount_y: flags["amount-y"] ? parseFloat(flags["amount-y"]) : 0,
-      strategy: flags.strategy || "spot",
-      single_sided_x: argv.includes("--single-sided-x"),
+      strategy: flags.strategy,
     }));
     break;
   }

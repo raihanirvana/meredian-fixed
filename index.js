@@ -4,15 +4,15 @@ import { config as loadDotenv } from "dotenv";
 import { ENV_PATH } from "./paths.js";
 import { agentLoop } from "./agent.js";
 import { log } from "./logger.js";
-import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
+import { getMyPositions, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates } from "./tools/screening.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
 import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
-import { registerCronRestarter } from "./tools/executor.js";
-import { startPolling, stopPolling, sendMessage, sendHTML, notifyOutOfRange, isEnabled as telegramEnabled } from "./telegram.js";
+import { executeTool, registerCronRestarter } from "./tools/executor.js";
+import { startPolling, stopPolling, sendMessage, sendHTML, notifyOutOfRange, notifyDailyPnl, notifyCircuitBreaker, isEnabled as telegramEnabled } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, setPositionInstruction, updatePnlAndCheckExits } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, setPositionInstruction, updatePnlAndCheckExits, isCircuitBreakerActive, getDailyPnl, isDailyLossLimitReached, isRebalanceLimitReached, activateCircuitBreaker } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
@@ -48,9 +48,55 @@ function formatCountdown(seconds) {
   return m > 0 ? `${m}m ${s}s` : `${s}s`;
 }
 
+function getClosePnlDisplay(result) {
+  if (config.management.solMode) {
+    return {
+      symbol: "◎",
+      value: result.pnl_sol ?? result.pnl_usd ?? 0,
+      pct: result.pnl_sol_pct ?? result.pnl_pct,
+    };
+  }
+  return {
+    symbol: "$",
+    value: result.pnl_usd ?? 0,
+    pct: result.pnl_pct,
+  };
+}
+
+function getAdaptiveScreeningIntervalMin(now = new Date()) {
+  const wibH = (now.getUTCHours() + 7) % 24; // WIB = UTC+7
+  if ((wibH >= 14 && wibH < 17) || (wibH >= 20 || wibH < 2) || (wibH >= 7 && wibH < 9)) {
+    return 10;
+  }
+  if (wibH >= 2 && wibH < 7) {
+    return 60;
+  }
+  return 30;
+}
+
+async function executeCircuitBreaker({ reason, positions, announce = true, activate = true }) {
+  const lines = [];
+  for (const p of positions) {
+    const closeResult = await executeTool("close_position", {
+      position_address: p.position,
+      reason: "circuit breaker",
+    });
+    if (closeResult?.success && !closeResult?.error) {
+      lines.push(`${p.pair}: emergency-closed`);
+    } else {
+      lines.push(`${p.pair}: emergency close failed — ${closeResult?.reason || closeResult?.error || JSON.stringify(closeResult)}`);
+    }
+  }
+  if (activate) activateCircuitBreaker(reason);
+  if (announce && telegramEnabled()) {
+    notifyCircuitBreaker({ reason }).catch(() => { });
+  }
+  return lines;
+}
+
 function buildPrompt() {
   const mgmt = formatCountdown(nextRunIn(timers.managementLastRun, config.schedule.managementIntervalMin));
-  const scrn = formatCountdown(nextRunIn(timers.screeningLastRun, config.schedule.screeningIntervalMin));
+  const scrn = formatCountdown(nextRunIn(timers.screeningLastRun, getAdaptiveScreeningIntervalMin()));
   return `[manage: ${mgmt} | screen: ${scrn}]\n> `;
 }
 
@@ -120,6 +166,40 @@ export async function runManagementCycle({ silent = false } = {}) {
     const livePositions = await getMyPositions({ force: true }).catch(() => null);
     positions = livePositions?.positions || [];
 
+    if (isCircuitBreakerActive()) {
+      if (positions.length > 0) {
+        const breakerLines = await executeCircuitBreaker({
+          reason: "Circuit breaker active — ensuring all open positions are closed",
+          positions,
+          announce: false,
+          activate: false,
+        });
+        mgmtReport = breakerLines.join("\n");
+      } else {
+        mgmtReport = "Circuit breaker active — no open positions.";
+      }
+      return mgmtReport;
+    }
+
+    const lossCheckAtStart = isDailyLossLimitReached(config.management.maxDailyLossSol);
+    if (lossCheckAtStart.exceeded) {
+      const breakerReason = `Daily loss limit reached: ${lossCheckAtStart.currentLoss} SOL (limit: ${lossCheckAtStart.limit} SOL)`;
+      if (positions.length > 0) {
+        const breakerLines = await executeCircuitBreaker({
+          reason: breakerReason,
+          positions,
+          announce: true,
+          activate: true,
+        });
+        mgmtReport = breakerLines.join("\n");
+      } else {
+        activateCircuitBreaker(breakerReason);
+        if (telegramEnabled()) notifyCircuitBreaker({ reason: breakerReason }).catch(() => { });
+        mgmtReport = breakerReason;
+      }
+      return mgmtReport;
+    }
+
     if (positions.length === 0) {
       log("cron", "No open positions — triggering screening cycle");
       runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
@@ -176,29 +256,46 @@ export async function runManagementCycle({ silent = false } = {}) {
         actionMap.set(p.position, { action: "CLOSE", rule: 1, reason: "stop loss" });
         continue;
       }
-      // Rule 2: take profit
-      if (!pnlSuspect && p.pnl_pct != null && p.pnl_pct >= config.management.takeProfitFeePct) {
+      const hasPartialTakeProfit = (tracked?.partial_close_count || 0) > 0;
+      // Rule 2: partial scale-out at +5% once, then let trailing TP manage the runner
+      if (!pnlSuspect && !hasPartialTakeProfit && p.pnl_pct != null && p.pnl_pct >= 5) {
+        actionMap.set(p.position, { action: "PARTIAL_CLOSE", rule: 2, reason: "scale out 50% at +5% PnL" });
+        continue;
+      }
+      // Rule 3: take profit (only before any scale-out has happened)
+      if (!pnlSuspect && !hasPartialTakeProfit && p.pnl_pct != null && p.pnl_pct >= config.management.takeProfitFeePct) {
         actionMap.set(p.position, { action: "CLOSE", rule: 2, reason: "take profit" });
         continue;
       }
-      // Rule 3: pumped far above range
+      // Rule 4: pumped far above range
       if (p.active_bin != null && p.upper_bin != null &&
           p.active_bin > p.upper_bin + config.management.outOfRangeBinsToClose) {
         actionMap.set(p.position, { action: "CLOSE", rule: 3, reason: "pumped far above range" });
         continue;
       }
-      // Rule 4: stale above range
+      // Rule 5: stale above range — rebalance if limit not reached, otherwise close
       if (p.active_bin != null && p.upper_bin != null &&
           p.active_bin > p.upper_bin &&
           (p.minutes_out_of_range ?? 0) >= config.management.outOfRangeWaitMinutes) {
-        actionMap.set(p.position, { action: "CLOSE", rule: 4, reason: "OOR" });
+        const atRebalanceLimit = isRebalanceLimitReached(p.position, config.management.maxRebalancesPerPosition);
+        if (!atRebalanceLimit) {
+          actionMap.set(p.position, { action: "REBALANCE", rule: 4, reason: "OOR — rebalancing to current range" });
+        } else {
+          actionMap.set(p.position, { action: "CLOSE", rule: 4, reason: "OOR — rebalance limit reached" });
+        }
         continue;
       }
-      // Rule 5: fee yield too low
+      // Rule 6: fee yield too low
       if (p.fee_per_tvl_24h != null &&
           p.fee_per_tvl_24h < config.management.minFeePerTvl24h &&
           (p.age_minutes ?? 0) >= config.management.minAgeBeforeYieldCheck) {
         actionMap.set(p.position, { action: "CLOSE", rule: 5, reason: "low yield" });
+        continue;
+      }
+      // Rule 7: max hold time with low return
+      const maxHold = config.management.maxHoldMinutes;
+      if (maxHold && (p.age_minutes ?? 0) >= maxHold && (p.pnl_pct ?? 0) < 2) {
+        actionMap.set(p.position, { action: "CLOSE", rule: 6, reason: `max hold time (${p.age_minutes}m >= ${maxHold}m, return ${p.pnl_pct ?? 0}%)` });
         continue;
       }
       // Claim rule
@@ -223,7 +320,9 @@ export async function runManagementCycle({ silent = false } = {}) {
       if (p.instruction) line += `\nNote: "${p.instruction}"`;
       if (act.action === "CLOSE" && act.rule === "exit") line += `\n⚡ Trailing TP: ${act.reason}`;
       if (act.action === "CLOSE" && act.rule && act.rule !== "exit") line += `\nRule ${act.rule}: ${act.reason}`;
+      if (act.action === "PARTIAL_CLOSE") line += `\n→ Scaling out 50%`;
       if (act.action === "CLAIM") line += `\n→ Claiming fees`;
+      if (act.action === "REBALANCE") line += `\n→ Rebalancing to current range`;
       return line;
     });
 
@@ -242,10 +341,116 @@ export async function runManagementCycle({ silent = false } = {}) {
       return a.action !== "STAY";
     });
 
-    if (actionPositions.length > 0) {
-      log("cron", `Management: ${actionPositions.length} action(s) needed — invoking LLM [model: ${config.llm.managementModel}]`);
+    const rebalancePositions = actionPositions.filter((p) => actionMap.get(p.position)?.action === "REBALANCE");
+    const partialClosePositions = actionPositions.filter((p) => actionMap.get(p.position)?.action === "PARTIAL_CLOSE");
+    const llmActionPositions = actionPositions.filter((p) => {
+      const action = actionMap.get(p.position)?.action;
+      return action !== "REBALANCE" && action !== "PARTIAL_CLOSE";
+    });
 
-      const actionBlocks = actionPositions.map((p) => {
+    const lossCheckBeforeExecution = isDailyLossLimitReached(config.management.maxDailyLossSol);
+    if (lossCheckBeforeExecution.exceeded && positions.length > 0) {
+      const breakerReason = `Daily loss limit reached: ${lossCheckBeforeExecution.currentLoss} SOL (limit: ${lossCheckBeforeExecution.limit} SOL)`;
+      const breakerLines = await executeCircuitBreaker({
+        reason: breakerReason,
+        positions,
+        announce: true,
+        activate: true,
+      });
+      mgmtReport += `\n\n${breakerLines.join("\n")}`;
+      return mgmtReport;
+    }
+
+    if (rebalancePositions.length > 0) {
+      log("cron", `Management: executing ${rebalancePositions.length} rebalance(s) directly`);
+      const rebalanceLines = [];
+      for (const p of rebalancePositions) {
+        const tracked = getTrackedPosition(p.position);
+        if (!tracked) {
+          rebalanceLines.push(`${p.pair}: rebalance skipped — missing tracked metadata`);
+          continue;
+        }
+
+        const closeResult = await executeTool("close_position", {
+          position_address: p.position,
+          reason: "rebalance",
+        });
+        if (closeResult?.blocked) {
+          rebalanceLines.push(`${p.pair}: rebalance blocked — ${closeResult.reason}`);
+          continue;
+        }
+        if (closeResult?.success === false || closeResult?.error) {
+          rebalanceLines.push(`${p.pair}: rebalance close failed — ${closeResult.error || JSON.stringify(closeResult)}`);
+          continue;
+        }
+
+        const postCloseBalances = await getWalletBalances().catch(() => null);
+        const desiredAmountSol = tracked.amount_sol ?? 0;
+        const maxAffordable = Math.max(0, (postCloseBalances?.sol || 0) - config.management.gasReserve);
+        const redeployAmountSol = Math.round(Math.min(desiredAmountSol, maxAffordable) * 1e6) / 1e6;
+        if (redeployAmountSol < 0.1) {
+          rebalanceLines.push(`${p.pair}: closed but redeploy skipped — only ${redeployAmountSol} SOL available after gas reserve`);
+          continue;
+        }
+
+        const deployResult = await executeTool("deploy_position", {
+          pool_address: p.pool,
+          amount_sol: redeployAmountSol,
+          strategy: tracked.strategy,
+          bins_below: tracked.bin_range?.bins_below,
+          bins_above: tracked.bin_range?.bins_above,
+          pool_name: tracked.pool_name || p.pair,
+          bin_step: tracked.bin_step,
+          volatility: tracked.volatility,
+          fee_tvl_ratio: tracked.fee_tvl_ratio,
+          organic_score: tracked.organic_score,
+          initial_value_usd: tracked.initial_value_usd,
+          rebalance_from: p.position,
+          base_mint: p.base_mint,
+        });
+        if (deployResult?.blocked) {
+          rebalanceLines.push(`${p.pair}: closed, redeploy blocked — ${deployResult.reason}`);
+          continue;
+        }
+        if (deployResult?.success === false || deployResult?.error) {
+          rebalanceLines.push(`${p.pair}: closed, redeploy failed — ${deployResult.error || JSON.stringify(deployResult)}`);
+          continue;
+        }
+
+        rebalanceLines.push(`${p.pair}: rebalanced into ${deployResult.position?.slice(0, 8) || "new position"} with ${redeployAmountSol} SOL`);
+      }
+      if (rebalanceLines.length > 0) {
+        mgmtReport += `\n\n${rebalanceLines.join("\n")}`;
+      }
+    }
+
+    if (partialClosePositions.length > 0) {
+      log("cron", `Management: executing ${partialClosePositions.length} partial close(s) directly`);
+      const partialCloseLines = [];
+      for (const p of partialClosePositions) {
+        const partialResult = await executeTool("partial_close_position", {
+          position_address: p.position,
+          bps: 5000,
+        });
+        if (partialResult?.blocked) {
+          partialCloseLines.push(`${p.pair}: partial close blocked — ${partialResult.reason}`);
+          continue;
+        }
+        if (partialResult?.success === false || partialResult?.error) {
+          partialCloseLines.push(`${p.pair}: partial close failed — ${partialResult.error || JSON.stringify(partialResult)}`);
+          continue;
+        }
+        partialCloseLines.push(`${p.pair}: scaled out 50% (${partialResult.txs?.[0] || "tx ok"})`);
+      }
+      if (partialCloseLines.length > 0) {
+        mgmtReport += `\n\n${partialCloseLines.join("\n")}`;
+      }
+    }
+
+    if (llmActionPositions.length > 0) {
+      log("cron", `Management: ${llmActionPositions.length} action(s) needed — invoking LLM [model: ${config.llm.managementModel}]`);
+
+      const actionBlocks = llmActionPositions.map((p) => {
         const act = actionMap.get(p.position);
         return [
           `POSITION: ${p.pair} (${p.position})`,
@@ -258,13 +463,14 @@ export async function runManagementCycle({ silent = false } = {}) {
       }).join("\n\n");
 
       const { content } = await agentLoop(`
-MANAGEMENT ACTION REQUIRED — ${actionPositions.length} position(s)
+MANAGEMENT ACTION REQUIRED — ${llmActionPositions.length} position(s)
 
 ${actionBlocks}
 
 RULES:
 - CLOSE: call close_position only — it handles fee claiming internally, do NOT call claim_fees first
 - CLAIM: call claim_fees with position address
+- REBALANCE: call close_position (reason="rebalance"), then deploy_position at the same pool with rebalance_from=<old_position_address>, same strategy, same deploy amount. Fetch active_bin first if needed.
 - INSTRUCTION: evaluate the instruction condition. If met → close_position. If not → HOLD, do nothing.
 - ⚡ exit alerts: close immediately, no exceptions
 
@@ -273,7 +479,7 @@ After executing, write a brief one-line result per position.
       `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 2048);
 
       mgmtReport += `\n\n${content}`;
-    } else {
+    } else if (rebalancePositions.length === 0 && partialClosePositions.length === 0) {
       log("cron", "Management: all positions STAY — skipping LLM");
     }
 
@@ -296,6 +502,17 @@ After executing, write a brief one-line result per position.
           notifyOutOfRange({ pair: p.pair, minutesOOR: p.minutes_out_of_range }).catch(() => { });
         }
       }
+      // Daily P&L target notification
+      const daily = getDailyPnl();
+      const target = config.management.dailyProfitTargetSol;
+      if (target && daily.net >= target && daily.trades_closed > 0) {
+        notifyDailyPnl({ ...daily, targetHit: true }).catch(() => { });
+      }
+      // Daily loss limit notification
+      const lossCheck = isDailyLossLimitReached(config.management.maxDailyLossSol);
+      if (lossCheck.exceeded && !isCircuitBreakerActive()) {
+        notifyCircuitBreaker({ reason: `Daily loss limit reached: ${lossCheck.currentLoss} SOL (limit: ${lossCheck.limit} SOL)` }).catch(() => { });
+      }
     }
   }
   return mgmtReport;
@@ -311,6 +528,18 @@ export async function runScreeningCycle({ silent = false } = {}) {
   timers.screeningLastRun = Date.now();
 
   // Hard guards — don't even run the agent if preconditions aren't met
+  if (isCircuitBreakerActive()) {
+    log("cron", "Screening skipped — circuit breaker active");
+    _screeningBusy = false;
+    return null;
+  }
+  const lossCheck = isDailyLossLimitReached(config.management.maxDailyLossSol);
+  if (lossCheck.exceeded) {
+    log("cron", `Screening skipped — daily loss limit reached (${lossCheck.currentLoss}/${lossCheck.limit} SOL)`);
+    _screeningBusy = false;
+    return null;
+  }
+
   let prePositions, preBalance;
   try {
     [prePositions, preBalance] = await Promise.all([getMyPositions({ force: true }), getWalletBalances()]);
@@ -504,7 +733,17 @@ export function startCronJobs() {
     await runManagementCycle();
   });
 
-  const screenTask = cron.schedule(`*/${Math.max(1, config.schedule.screeningIntervalMin)} * * * *`, runScreeningCycle);
+  // Adaptive screening — exact PRD cadence:
+  // peak 10m, off-peak 30m, dead zone 60m.
+  let _lastScreenTrigger = 0;
+  const screenTask = cron.schedule(`* * * * *`, () => {
+    const interval = getAdaptiveScreeningIntervalMin();
+    const elapsed = (Date.now() - _lastScreenTrigger) / 60_000;
+    if (elapsed >= interval) {
+      _lastScreenTrigger = Date.now();
+      runScreeningCycle();
+    }
+  });
 
   const healthEvery = Math.max(1, config.schedule.healthCheckIntervalMin);
   const healthTask = cron.schedule(`*/${healthEvery} * * * *`, async () => {
@@ -565,7 +804,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
   _cronTasks = [mgmtTask, screenTask, healthTask, briefingTask, briefingWatchdog];
   // Store interval ref so stopCronJobs can clear it
   _cronTasks._pnlPollInterval = pnlPollInterval;
-  log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m`);
+  log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening adaptive 10m/30m/60m`);
 }
 
 // ═══════════════════════════════════════════
@@ -761,11 +1000,12 @@ if (isTTY) {
         if (idx < 0 || idx >= positions.length) { await sendMessage(`Invalid number. Use /positions first.`); return; }
         const pos = positions[idx];
         await sendMessage(`Closing ${pos.pair}...`);
-        const result = await closePosition({ position_address: pos.position });
+        const result = await executeTool("close_position", { position_address: pos.position });
         if (result.success) {
           const closeTxs = result.close_txs?.length ? result.close_txs : result.txs;
           const claimNote = result.claim_txs?.length ? `\nClaim txs: ${result.claim_txs.join(", ")}` : "";
-          await sendMessage(`✅ Closed ${pos.pair}\nPnL: ${config.management.solMode ? "◎" : "$"}${result.pnl_usd ?? "?"} | close txs: ${closeTxs?.join(", ") || "n/a"}${claimNote}`);
+          const pnl = getClosePnlDisplay(result);
+          await sendMessage(`✅ Closed ${pos.pair}\nPnL: ${pnl.symbol}${pnl.value ?? "?"}${pnl.pct != null ? ` (${pnl.pct}%)` : ""} | close txs: ${closeTxs?.join(", ") || "n/a"}${claimNote}`);
         } else {
           await sendMessage(`❌ Close failed: ${JSON.stringify(result)}`);
         }
@@ -784,6 +1024,22 @@ if (isTTY) {
         setPositionInstruction(pos.position, note);
         await sendMessage(`✅ Note set for ${pos.pair}:\n"${note}"`);
       } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => { }); }
+      return;
+    }
+
+    if (text === "/resume") {
+      const { resumeCircuitBreaker } = await import("./state.js");
+      resumeCircuitBreaker();
+      await sendMessage("✅ Circuit breaker deactivated. Deploys re-enabled.");
+      return;
+    }
+
+    if (text === "/daily") {
+      const daily = getDailyPnl();
+      const sign = daily.net >= 0 ? "+" : "";
+      const target = config.management.dailyProfitTargetSol;
+      const targetLine = target ? `\nTarget: ${daily.net >= target ? "✅" : "⏳"} ${sign}${daily.net.toFixed(4)} / ${target} SOL` : "";
+      await sendMessage(`📊 Daily P&L (${daily.date})\nNet: ${sign}${daily.net.toFixed(4)} SOL\nRealized: ${daily.realized.toFixed(4)} | Fees: ${daily.fees_claimed.toFixed(4)} | Losses: ${daily.losses.toFixed(4)}\nTrades: ${daily.trades_opened} opened, ${daily.trades_closed} closed${targetLine}`);
       return;
     }
 

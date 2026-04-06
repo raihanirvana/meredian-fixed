@@ -203,6 +203,27 @@ export async function getTopCandidates({ limit = 10 } = {}) {
       if (eligible.length < before) log("screening", `ATH filter removed ${before - eligible.length} pool(s)`);
     }
 
+    // Volume velocity filter — PRD: only deploy when volume is rising, bonus for > +50%
+    const minVolTrend = config.screening.minVolumeTrendPct;
+    if (minVolTrend != null) {
+      const volBefore = eligible.length;
+      eligible.splice(0, eligible.length, ...eligible.filter((p) => {
+        if (p.volume_change_pct == null) {
+          log("screening", `Volume velocity: dropped ${p.name} — volume_change unavailable`);
+          return false;
+        }
+        if (p.volume_change_pct <= minVolTrend) {
+          log("screening", `Volume velocity: dropped ${p.name} — volume_change=${p.volume_change_pct}% <= ${minVolTrend}%`);
+          return false;
+        }
+        return true;
+      }));
+      if (eligible.length < volBefore) log("screening", `Volume velocity filter removed ${volBefore - eligible.length} pool(s)`);
+    }
+    for (const p of eligible) {
+      p.volume_velocity_bonus = p.volume_change_pct != null && p.volume_change_pct > 50 ? 5 : 0;
+    }
+
     // Drop any pools whose creator is on the dev blocklist (caught via advanced-info)
     const before = eligible.length;
     const filtered = eligible.filter((p) => {
@@ -242,6 +263,14 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   }
 
   const totalEligible = eligible.length;
+
+  eligible.sort((a, b) => {
+    const bonusDiff = (b.volume_velocity_bonus || 0) - (a.volume_velocity_bonus || 0);
+    if (bonusDiff !== 0) return bonusDiff;
+    const velocityDiff = (b.volume_change_pct || 0) - (a.volume_change_pct || 0);
+    if (velocityDiff !== 0) return velocityDiff;
+    return (b.fee_active_tvl_ratio || 0) - (a.fee_active_tvl_ratio || 0);
+  });
 
   return {
     candidates: eligible.slice(0, limit),
@@ -333,6 +362,7 @@ function condensePool(p) {
 
     // Activity trends
     volume_change_pct: fix(p.volume_change_pct, 1),
+    volume_velocity_bonus: p.volume_change_pct != null && p.volume_change_pct > 50 ? 5 : 0,
     fee_change_pct: fix(p.fee_change_pct, 1),
     swap_count: p.swap_count,
     unique_traders: p.unique_traders,

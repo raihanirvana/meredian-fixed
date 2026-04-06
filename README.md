@@ -227,8 +227,8 @@ meridian deploy --pool <addr> --amount <sol> [--bins-below 69] [--bins-above 0] 
 meridian claim --position <addr>
 meridian close --position <addr> [--skip-swap] [--dry-run]
 meridian swap --from <mint> --to <mint> --amount <n> [--dry-run]
-meridian add-liquidity --position <addr> --pool <addr> [--amount-x <n>] [--amount-y <n>] [--strategy spot]
-meridian withdraw-liquidity --position <addr> --pool <addr> [--bps 10000]
+meridian add-liquidity --position <addr> [--amount-x <n>] [--amount-y <n>] [--strategy spot]
+meridian withdraw-liquidity --position <addr> [--bps 10000]
 ```
 
 **Agent cycles**

@@ -150,11 +150,11 @@ export async function notifyDeploy({ pair, amountSol, position, tx, priceRange, 
   );
 }
 
-export async function notifyClose({ pair, pnlUsd, pnlPct }) {
-  const sign = pnlUsd >= 0 ? "+" : "";
+export async function notifyClose({ pair, pnlValue, pnlPct, currencySymbol = "$" }) {
+  const sign = pnlValue >= 0 ? "+" : "";
   await sendHTML(
     `🔒 <b>Closed</b> ${pair}\n` +
-    `PnL: ${sign}$${(pnlUsd ?? 0).toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)`
+    `PnL: ${sign}${currencySymbol}${(pnlValue ?? 0).toFixed(2)} (${sign}${(pnlPct ?? 0).toFixed(2)}%)`
   );
 }
 
@@ -170,6 +170,27 @@ export async function notifyOutOfRange({ pair, minutesOOR }) {
   await sendHTML(
     `⚠️ <b>Out of Range</b> ${pair}\n` +
     `Been OOR for ${minutesOOR} minutes`
+  );
+}
+
+export async function notifyDailyPnl({ date, net, realized, fees_claimed, losses, trades_opened, trades_closed, targetHit }) {
+  const sign = net >= 0 ? "+" : "";
+  let emoji = "📉";
+  if (targetHit) emoji = "🎯";
+  else if (net >= 0) emoji = "📊";
+  await sendHTML(
+    `${emoji} <b>Daily P&amp;L${targetHit ? " — TARGET HIT!" : ""}</b> ${date}\n` +
+    `Net: ${sign}${net.toFixed(4)} SOL\n` +
+    `Realized: ${realized.toFixed(4)} | Fees: ${fees_claimed.toFixed(4)} | Losses: ${losses.toFixed(4)}\n` +
+    `Trades: ${trades_opened} opened, ${trades_closed} closed`
+  );
+}
+
+export async function notifyCircuitBreaker({ reason }) {
+  await sendHTML(
+    `🚨 <b>CIRCUIT BREAKER ACTIVATED</b>\n` +
+    `Reason: ${reason}\n` +
+    `All deploys paused. Send /resume to re-enable.`
   );
 }
 

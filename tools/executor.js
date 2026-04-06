@@ -2,17 +2,19 @@ import { discoverPools, getPoolDetail, getTopCandidates } from "./screening.js";
 import {
   getActiveBin,
   deployPosition,
+  addLiquidity,
   getMyPositions,
   getWalletPositions,
   getPositionPnl,
   claimFees,
   closePosition,
+  partialClosePosition,
   searchPools,
 } from "./dlmm.js";
 import { getWalletBalances, swapToken } from "./wallet.js";
 import { studyTopLPers } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
-import { setPositionInstruction } from "../state.js";
+import { setPositionInstruction, isDailyLossLimitReached, isCircuitBreakerActive, recordDailyPnl, recordDailyFees, recordDailyOpen, getDailyPnl } from "../state.js";
 
 import { getPoolMemory, addPoolNote } from "../pool-memory.js";
 import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStrategy } from "../strategy-library.js";
@@ -54,6 +56,7 @@ const toolMap = {
   check_smart_wallets_on_pool: checkSmartWalletsOnPool,
   claim_fees: claimFees,
   close_position: closePosition,
+  partial_close_position: partialClosePosition,
   get_wallet_balance: getWalletBalances,
   swap_token: swapToken,
   get_top_lpers: studyTopLPers,
@@ -148,6 +151,7 @@ const toolMap = {
       minTokenAgeHours: ["screening", "minTokenAgeHours"],
       maxTokenAgeHours: ["screening", "maxTokenAgeHours"],
       athFilterPct:     ["screening", "athFilterPct"],
+      minVolumeTrendPct: ["screening", "minVolumeTrendPct"],
       minFeePerTvl24h: ["management", "minFeePerTvl24h"],
       // management
       minClaimAmount: ["management", "minClaimAmount"],
@@ -161,6 +165,11 @@ const toolMap = {
       trailingTriggerPct: ["management", "trailingTriggerPct"],
       trailingDropPct: ["management", "trailingDropPct"],
       solMode: ["management", "solMode"],
+      maxHoldMinutes: ["management", "maxHoldMinutes"],
+      maxDailyLossSol: ["management", "maxDailyLossSol"],
+      dailyProfitTargetSol: ["management", "dailyProfitTargetSol"],
+      maxRebalancesPerPosition: ["management", "maxRebalancesPerPosition"],
+      autoCompoundFees: ["management", "autoCompoundFees"],
       minSolToOpen: ["management", "minSolToOpen"],
       deployAmountSol: ["management", "deployAmountSol"],
       gasReserve: ["management", "gasReserve"],
@@ -247,6 +256,7 @@ const WRITE_TOOLS = new Set([
   "deploy_position",
   "claim_fees",
   "close_position",
+  "partial_close_position",
   "swap_token",
 ]);
 
@@ -282,7 +292,7 @@ export async function executeTool(name, args) {
   // ─── Execute ──────────────────────────────
   try {
     let preExecutionBalances = null;
-    if (name === "close_position" || (name === "claim_fees" && config.management.autoSwapAfterClaim)) {
+    if (name === "close_position" || (name === "claim_fees" && (config.management.autoSwapAfterClaim || config.management.autoCompoundFees))) {
       try {
         preExecutionBalances = await getWalletBalances({});
       } catch {
@@ -306,9 +316,32 @@ export async function executeTool(name, args) {
       if (name === "swap_token" && result.tx) {
         notifySwap({ inputSymbol: args.input_mint?.slice(0, 8), outputSymbol: args.output_mint === "So11111111111111111111111111111111111111112" || args.output_mint === "SOL" ? "SOL" : args.output_mint?.slice(0, 8), amountIn: result.amount_in, amountOut: result.amount_out, tx: result.tx }).catch(() => {});
       } else if (name === "deploy_position") {
+        recordDailyOpen();
+        // If this is a rebalance, link old → new position for rebalance count tracking
+        if (args.rebalance_from && result.position) {
+          const { recordRebalance } = await import("../state.js");
+          recordRebalance(args.rebalance_from, result.position);
+        }
         notifyDeploy({ pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
       } else if (name === "close_position") {
-        notifyClose({ pair: result.pool_name || args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlPct: result.pnl_pct ?? 0 }).catch(() => {});
+        // Record daily P&L in SOL — prefer absolute SOL PnL when available.
+        const pnlPctForRecord = result.pnl_sol_pct ?? result.pnl_pct;
+        if (result.pnl_sol != null) {
+          recordDailyPnl(result.pnl_sol);
+        } else if (pnlPctForRecord != null) {
+          const tracked = (await import("../state.js")).getTrackedPosition(args.position_address);
+          const amountSol = tracked?.amount_sol || 0;
+          recordDailyPnl(amountSol * (pnlPctForRecord / 100));
+        }
+        const pnlValue = config.management.solMode
+          ? (result.pnl_sol ?? result.pnl_usd ?? 0)
+          : (result.pnl_usd ?? 0);
+        notifyClose({
+          pair: result.pool_name || args.position_address?.slice(0, 8),
+          pnlValue,
+          pnlPct: config.management.solMode ? (result.pnl_sol_pct ?? result.pnl_pct ?? 0) : (result.pnl_pct ?? 0),
+          currencySymbol: config.management.solMode ? "◎" : "$",
+        }).catch(() => {});
         // Note low-yield closes in pool memory so screener avoids redeploying
         if (args.reason && args.reason.toLowerCase().includes("yield")) {
           const poolAddr = result.pool || args.pool_address;
@@ -336,7 +369,14 @@ export async function executeTool(name, args) {
             log("executor_warn", `Auto-swap after close failed: ${e.message}`);
           }
         }
-      } else if (name === "claim_fees" && config.management.autoSwapAfterClaim && result.base_mint) {
+      } else if (name === "claim_fees") {
+        if ((result.claimed_fees_sol ?? 0) > 0 || (result.claimed_fees_usd ?? 0) > 0) {
+          const solPrice = preExecutionBalances?.sol_price || 135;
+          recordDailyFees(result.claimed_fees_sol ?? ((result.claimed_fees_usd || 0) / solPrice));
+        }
+      }
+      const shouldSwapClaimFees = config.management.autoSwapAfterClaim || config.management.autoCompoundFees;
+      if (name === "claim_fees" && shouldSwapClaimFees && result.base_mint) {
         try {
           const balances = await getWalletBalances({});
           const token = balances.tokens?.find(t => t.mint === result.base_mint);
@@ -345,12 +385,47 @@ export async function executeTool(name, args) {
           const deltaUsd = Math.max(0, (token?.usd || 0) - (preToken?.usd || 0));
           if (token && deltaBalance > 0 && deltaUsd >= 0.10) {
             log("executor", `Auto-swapping claimed ${token.symbol || result.base_mint.slice(0, 8)} ($${deltaUsd.toFixed(2)}) back to SOL`);
-            await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: deltaBalance });
+            const swapResult = await swapToken({ input_mint: result.base_mint, output_mint: "SOL", amount: deltaBalance });
+            if (swapResult?.amount_out) result.sol_received = swapResult.amount_out;
           } else if (token && token.usd >= 0.10) {
             log("executor", `Skipping auto-swap after claim for ${token.symbol || result.base_mint.slice(0, 8)} - no fresh token delta detected`);
           }
         } catch (e) {
           log("executor_warn", `Auto-swap after claim failed: ${e.message}`);
+        }
+      }
+      if (name === "claim_fees" && config.management.autoCompoundFees && result.pool) {
+        try {
+          const tracked = (await import("../state.js")).getTrackedPosition(args.position_address);
+          const postClaimBalances = await getWalletBalances({});
+          const netSolDelta = Math.max(0, (postClaimBalances.sol || 0) - (preExecutionBalances?.sol || 0));
+          const compoundAmountSol = Math.round(netSolDelta * 1e6) / 1e6;
+          if (!tracked) {
+            result.compound_note = "Auto-compound skipped: tracked position metadata missing.";
+          } else if (compoundAmountSol < 0.01) {
+            result.compound_note = `Auto-compound skipped: fresh SOL delta too small (${compoundAmountSol} SOL).`;
+          } else {
+            log("executor", `Auto-compounding ${compoundAmountSol} SOL back into ${args.position_address.slice(0, 8)}`);
+            const compoundResult = await addLiquidity({
+              position_address: args.position_address,
+              pool_address: tracked.pool || result.pool,
+              amount_x: 0,
+              amount_y: compoundAmountSol,
+              strategy: tracked.strategy,
+              bins_below: tracked.bin_range?.bins_below,
+              bins_above: tracked.bin_range?.bins_above,
+            });
+            if (compoundResult?.success) {
+              result.compounded = true;
+              result.compound_amount_sol = compoundAmountSol;
+              result.compound_txs = compoundResult.txs;
+            } else {
+              result.compound_note = compoundResult?.error || "Auto-compound failed";
+            }
+          }
+        } catch (e) {
+          log("executor_warn", `Auto-compound after claim failed: ${e.message}`);
+          result.compound_note = `Auto-compound failed: ${e.message}`;
         }
       }
     }
@@ -381,6 +456,17 @@ export async function executeTool(name, args) {
 async function runSafetyChecks(name, args) {
   switch (name) {
     case "deploy_position": {
+      // Circuit breaker — block all deploys when active
+      if (isCircuitBreakerActive()) {
+        return { pass: false, reason: "Circuit breaker is active — all deploys paused. Use /resume to re-enable." };
+      }
+
+      // Daily loss limit — block new deploys when daily loss exceeds threshold
+      const lossCheck = isDailyLossLimitReached(config.management.maxDailyLossSol);
+      if (lossCheck.exceeded) {
+        return { pass: false, reason: `Daily loss limit reached: lost ${lossCheck.currentLoss} SOL today (limit: ${lossCheck.limit} SOL). No new deploys until tomorrow UTC.` };
+      }
+
       // Reject pools with bin_step out of configured range
       const minStep = config.screening.minBinStep;
       const maxStep = config.screening.maxBinStep;
@@ -393,7 +479,8 @@ async function runSafetyChecks(name, args) {
 
       // Check position count limit + duplicate pool guard — force fresh scan to avoid stale cache
       const positions = await getMyPositions({ force: true });
-      if (positions.total_positions >= config.risk.maxPositions) {
+      const effectiveOpenPositions = positions.total_positions - (args.rebalance_from ? 1 : 0);
+      if (effectiveOpenPositions >= config.risk.maxPositions) {
         return {
           pass: false,
           reason: `Max positions (${config.risk.maxPositions}) reached. Close a position first.`,
@@ -402,7 +489,7 @@ async function runSafetyChecks(name, args) {
       const alreadyInPool = positions.positions.some(
         (p) => p.pool === args.pool_address
       );
-      if (alreadyInPool) {
+      if (alreadyInPool && !args.rebalance_from) {
         return {
           pass: false,
           reason: `Already have an open position in pool ${args.pool_address}. Cannot open duplicate.`,
@@ -410,7 +497,7 @@ async function runSafetyChecks(name, args) {
       }
 
       // Block same base token across different pools
-      if (args.base_mint) {
+      if (args.base_mint && !args.rebalance_from) {
         const alreadyHasMint = positions.positions.some(
           (p) => p.base_mint === args.base_mint
         );

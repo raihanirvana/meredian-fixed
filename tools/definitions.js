@@ -288,6 +288,33 @@ WARNING: This executes a real on-chain transaction. Cannot be undone.`,
   {
     type: "function",
     function: {
+      name: "partial_close_position",
+      description: `Remove a percentage of liquidity from a position without closing it.
+Use for scale-out / profit-taking while staying in the pool.
+Examples: remove 50% at profit, reduce exposure, lock in gains while keeping some upside.
+
+Returns the transaction hash. Position stays open with remaining liquidity.
+WARNING: This executes a real on-chain transaction.`,
+      parameters: {
+        type: "object",
+        properties: {
+          position_address: {
+            type: "string",
+            description: "The position public key"
+          },
+          bps: {
+            type: "number",
+            description: "Basis points to remove (1-9999). 5000 = 50%, 2500 = 25%, 7500 = 75%."
+          }
+        },
+        required: ["position_address", "bps"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
       name: "get_wallet_positions",
       description: `Get all open DLMM positions for any Solana wallet address.
 Use this when the user asks about another wallet's positions, wants to monitor a wallet,

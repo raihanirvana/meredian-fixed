@@ -46,6 +46,7 @@ export const config = {
     minTokenAgeHours:   u.minTokenAgeHours   ?? null, // null = no minimum
     maxTokenAgeHours:   u.maxTokenAgeHours   ?? null, // null = no maximum
     athFilterPct:       u.athFilterPct       ?? null, // e.g. -20 = only deploy if price is >= 20% below ATH
+    minVolumeTrendPct:  u.minVolumeTrendPct  ?? 0,    // only deploy when volume is at least stable/rising
   },
 
   // ─── Position Management ────────────────
@@ -68,6 +69,16 @@ export const config = {
     trailingDropPct:       u.trailingDropPct       ?? 1.5,  // close when drops X% from peak
     // SOL mode — positions, PnL, and balances reported in SOL instead of USD
     solMode:               u.solMode               ?? false,
+    // Max hold time (minutes) — close positions held longer with <2% return
+    maxHoldMinutes:        u.maxHoldMinutes        ?? null,
+    // Daily loss limit in SOL — stop all deploys when reached
+    maxDailyLossSol:       u.maxDailyLossSol       ?? null,
+    // Daily profit target in SOL — send Telegram notification when reached
+    dailyProfitTargetSol:  u.dailyProfitTargetSol  ?? null,
+    // Max rebalances per position before force-closing
+    maxRebalancesPerPosition: u.maxRebalancesPerPosition ?? 2,
+    // Auto-compound: after claim+swap, redeploy in same pool
+    autoCompoundFees:  u.autoCompoundFees  ?? false,
   },
 
   // ─── Strategy Mapping ───────────────────

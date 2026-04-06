@@ -4,13 +4,13 @@ import { buildSystemPrompt } from "./prompt.js";
 import { executeTool } from "./tools/executor.js";
 import { tools } from "./tools/definitions.js";
 
-const MANAGER_TOOLS  = new Set(["close_position", "claim_fees", "swap_token", "update_config", "get_position_pnl", "get_my_positions", "set_position_note", "add_pool_note", "get_wallet_balance"]);
+const MANAGER_TOOLS  = new Set(["close_position", "partial_close_position", "claim_fees", "swap_token", "update_config", "get_position_pnl", "get_my_positions", "get_wallet_positions", "set_position_note", "add_pool_note", "get_wallet_balance"]);
 const SCREENER_TOOLS = new Set(["deploy_position", "get_active_bin", "get_top_candidates", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_pool_memory", "add_pool_note", "add_to_blacklist", "update_config", "get_wallet_balance", "get_my_positions"]);
 
 // Intent → tool subsets for GENERAL role
 const INTENT_TOOLS = {
   deploy:      new Set(["deploy_position", "get_top_candidates", "get_active_bin", "get_pool_memory", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_wallet_balance", "get_my_positions", "add_pool_note"]),
-  close:       new Set(["close_position", "get_my_positions", "get_position_pnl", "get_wallet_balance", "swap_token"]),
+  close:       new Set(["close_position", "partial_close_position", "get_my_positions", "get_position_pnl", "get_wallet_balance", "swap_token"]),
   claim:       new Set(["claim_fees", "get_my_positions", "get_position_pnl", "get_wallet_balance"]),
   swap:        new Set(["swap_token", "get_wallet_balance"]),
   config:      new Set(["update_config"]),

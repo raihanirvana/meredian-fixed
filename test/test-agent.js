@@ -3,8 +3,14 @@
  * Run: DRY_RUN=true node test/test-agent.js
  */
 
-import "dotenv/config";
+import fs from "fs";
+import { config as loadDotenv } from "dotenv";
+import { ENV_PATH } from "../paths.js";
 import { agentLoop } from "../agent.js";
+
+if (fs.existsSync(ENV_PATH)) {
+  loadDotenv({ path: ENV_PATH, override: true, quiet: true });
+}
 
 async function main() {
   console.log("=== Testing Agent Loop (DRY RUN) ===\n");
