@@ -89,7 +89,7 @@ export function recordPoolDeploy(poolAddress, deployData) {
       (withPnl.reduce((s, d) => s + d.pnl_pct, 0) / withPnl.length) * 100
     ) / 100;
     entry.win_rate = Math.round(
-      (withPnl.filter((d) => d.pnl_pct >= 0).length / withPnl.length) * 100
+      (withPnl.filter((d) => d.pnl_pct >= 0).length / withPnl.length) * 10000
     ) / 100;
   }
 

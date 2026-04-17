@@ -66,6 +66,7 @@ export function trackPosition({
   bin_range = {},
   amount_sol,
   amount_x = 0,
+  base_mint = null,
   active_bin,
   bin_step,
   volatility,
@@ -83,6 +84,7 @@ export function trackPosition({
       bin_range,
       amount_sol,
       amount_x,
+      base_mint,
       active_bin_at_deploy: active_bin,
       bin_step,
       volatility,
@@ -99,6 +101,9 @@ export function trackPosition({
       partial_close_count: 0,
       closed: false,
       closed_at: null,
+      closing_pending_since: null,
+      closing_pending_reason: null,
+      closing_pending_txs: [],
       notes: [],
       peak_pnl_pct: 0,
       trailing_active: false,
@@ -211,11 +216,52 @@ export function recordClose(position_address, reason) {
     if (!pos) return { value: false, save: false };
     pos.closed = true;
     pos.closed_at = new Date().toISOString();
+    pos.closing_pending_since = null;
+    pos.closing_pending_reason = null;
+    pos.closing_pending_txs = [];
     pos.notes.push(`Closed at ${pos.closed_at}: ${reason}`);
     pushEvent(state, { action: "close", position: position_address, pool_name: pos.pool_name || pos.pool, reason });
     return { value: true };
   });
   if (changed) log("state", `Position ${position_address} marked closed: ${reason}`);
+}
+
+/**
+ * Mark a position as having a close transaction submitted but not yet confirmed
+ * by the live position fetcher.
+ */
+export function markClosingPending(position_address, reason, txs = []) {
+  const changed = mutateState((state) => {
+    const pos = state.positions[position_address];
+    if (!pos || pos.closed) return { value: false, save: false };
+    pos.closing_pending_since = new Date().toISOString();
+    pos.closing_pending_reason = reason || null;
+    pos.closing_pending_txs = Array.isArray(txs) ? txs.filter(Boolean) : [];
+    pos.notes.push(`Close submitted at ${pos.closing_pending_since}${reason ? `: ${reason}` : ""}`);
+    pushEvent(state, { action: "close_submitted", position: position_address, pool_name: pos.pool_name || pos.pool, reason: reason || null });
+    return { value: true };
+  });
+  if (changed) log("state", `Position ${position_address} marked closing-pending`);
+  return changed;
+}
+
+/**
+ * Clear the closing-pending marker on a position.
+ */
+export function clearClosingPending(position_address) {
+  const changed = mutateState((state) => {
+    const pos = state.positions[position_address];
+    if (!pos) return { value: false, save: false };
+    if (!pos.closing_pending_since && !pos.closing_pending_reason && !(pos.closing_pending_txs || []).length) {
+      return { value: false, save: false };
+    }
+    pos.closing_pending_since = null;
+    pos.closing_pending_reason = null;
+    pos.closing_pending_txs = [];
+    return { value: true };
+  });
+  if (changed) log("state", `Position ${position_address} closing-pending cleared`);
+  return changed;
 }
 
 /**
@@ -316,6 +362,7 @@ export function getStateSummary() {
       initial_fee_tvl_24h: p.initial_fee_tvl_24h,
       rebalance_count: p.rebalance_count,
       partial_close_count: p.partial_close_count,
+      closing_pending_since: p.closing_pending_since || null,
       instruction: p.instruction || null,
     })),
     last_updated: state.lastUpdated,
@@ -514,7 +561,7 @@ export function getDailyPnl() {
 export function isDailyLossLimitReached(maxDailyLossSol) {
   if (!maxDailyLossSol || maxDailyLossSol <= 0) return { exceeded: false, currentLoss: 0, limit: 0 };
   const daily = getDailyPnl();
-  const currentLoss = Math.abs(Math.min(0, daily.net));
+  const currentLoss = Math.abs(Math.min(0, daily.losses || 0));
   return {
     exceeded: currentLoss >= maxDailyLossSol,
     currentLoss: Math.round(currentLoss * 10000) / 10000,
@@ -617,6 +664,9 @@ export function syncOpenPositions(active_addresses) {
 
       pos.closed = true;
       pos.closed_at = new Date().toISOString();
+      pos.closing_pending_since = null;
+      pos.closing_pending_reason = null;
+      pos.closing_pending_txs = [];
       pos.notes.push(`Auto-closed during state sync (not found on-chain)`);
       changed = true;
       log("state", `Position ${posId} auto-closed (missing from on-chain data)`);

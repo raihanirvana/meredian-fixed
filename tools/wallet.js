@@ -47,6 +47,7 @@ const JUPITER_ULTRA_API = "https://api.jup.ag/ultra/v1";
 const JUPITER_QUOTE_API = "https://api.jup.ag/swap/v1";
 const JUPITER_API_KEY = process.env.JUPITER_API_KEY || process.env.JUP_API_KEY || "";
 const SOL_MINT = "So11111111111111111111111111111111111111112";
+const TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 
 function buildJupiterHeaders(extra = {}) {
   return JUPITER_API_KEY
@@ -58,6 +59,48 @@ function buildJupiterHeaders(extra = {}) {
  * Get current wallet balances: SOL, USDC, and all SPL tokens using Helius Wallet API.
  * Returns USD-denominated values provided by Helius.
  */
+async function getWalletBalancesViaRpc(walletAddress, fallbackReason = null) {
+  const owner = new PublicKey(walletAddress);
+  const connection = getConnection();
+  const [lamports, tokenAccounts] = await Promise.all([
+    connection.getBalance(owner, "confirmed"),
+    connection.getParsedTokenAccountsByOwner(owner, { programId: TOKEN_PROGRAM_ID }, "confirmed"),
+  ]);
+
+  const tokens = tokenAccounts.value
+    .map(({ account }) => {
+      const info = account.data?.parsed?.info;
+      const tokenAmount = info?.tokenAmount;
+      const balance = Number(tokenAmount?.uiAmountString ?? tokenAmount?.uiAmount ?? 0);
+      if (!info?.mint || !Number.isFinite(balance) || balance <= 0) return null;
+      let symbol = info.mint.slice(0, 8);
+      if (info.mint === config.tokens.USDC) symbol = "USDC";
+      if (info.mint === config.tokens.USDT) symbol = "USDT";
+      if (info.mint === config.tokens.SOL) symbol = "SOL";
+      return {
+        mint: info.mint,
+        symbol,
+        balance: Math.round(balance * 1e6) / 1e6,
+        usd: null,
+      };
+    })
+    .filter(Boolean);
+
+  const usdcBalance = tokens.find((t) => t.mint === config.tokens.USDC)?.balance || 0;
+
+  return {
+    wallet: walletAddress,
+    sol: Math.round((lamports / LAMPORTS_PER_SOL) * 1e6) / 1e6,
+    sol_price: 0,
+    sol_usd: 0,
+    usdc: Math.round(usdcBalance * 100) / 100,
+    tokens,
+    total_usd: 0,
+    source: "rpc_fallback",
+    warning: fallbackReason || "Using RPC fallback — USD pricing unavailable",
+  };
+}
+
 export async function getWalletBalances() {
   let walletAddress;
   try {
@@ -69,7 +112,11 @@ export async function getWalletBalances() {
   const HELIUS_KEY = process.env.HELIUS_API_KEY;
   if (!HELIUS_KEY) {
     log("wallet_error", "HELIUS_API_KEY not set in .env");
-    return { wallet: walletAddress, sol: 0, sol_price: 0, sol_usd: 0, usdc: 0, tokens: [], total_usd: 0, error: "Helius API key missing" };
+    try {
+      return await getWalletBalancesViaRpc(walletAddress, "Helius API key missing");
+    } catch (fallbackError) {
+      return { wallet: walletAddress, sol: 0, sol_price: 0, sol_usd: 0, usdc: 0, tokens: [], total_usd: 0, error: `Helius API key missing; RPC fallback failed: ${fallbackError.message}` };
+    }
   }
 
   try {
@@ -111,15 +158,19 @@ export async function getWalletBalances() {
     };
   } catch (error) {
     log("wallet_error", error.message);
-    return {
-      wallet: walletAddress,
-      sol: 0,
-      sol_price: 0,
-      sol_usd: 0,
-      usdc: 0,
-      tokens: [],
-      total_usd: 0,
-      error: error.message,
+    try {
+      return await getWalletBalancesViaRpc(walletAddress, `Helius unavailable: ${error.message}`);
+    } catch (fallbackError) {
+      return {
+        wallet: walletAddress,
+        sol: 0,
+        sol_price: 0,
+        sol_usd: 0,
+        usdc: 0,
+        tokens: [],
+        total_usd: 0,
+        error: `${error.message}; RPC fallback failed: ${fallbackError.message}`,
+      };
     };
   }
 }

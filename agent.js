@@ -204,10 +204,18 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       if (!msg.tool_calls || msg.tool_calls.length === 0) {
         // Hermes sometimes returns null content — pop the empty message and retry once
         if (!msg.content) {
+          emptyStreak += 1;
           messages.pop(); // remove the empty assistant message
-          log("agent", "Empty response, retrying...");
+          log("agent", `Empty response, retrying... (${emptyStreak}/2)`);
+          if (emptyStreak >= 2) {
+            return {
+              content: "I couldn't complete that reliably because the model returned empty responses twice in a row.",
+              userMessage: goal,
+            };
+          }
           continue;
         }
+        emptyStreak = 0;
         if (mustUseRealTool && !sawToolCall) {
           noToolRetryCount += 1;
           messages.pop();
@@ -228,6 +236,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
         log("agent", msg.content);
         return { content: msg.content, userMessage: goal };
       }
+      emptyStreak = 0;
       sawToolCall = true;
 
       // Execute each tool call in parallel

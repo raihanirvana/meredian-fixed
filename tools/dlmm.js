@@ -14,6 +14,9 @@ import {
   recordLiquidityAdded,
   recordLiquidityRemoved,
   getTrackedPosition,
+  getTrackedPositions,
+  markClosingPending,
+  clearClosingPending,
   minutesOutOfRange,
   syncOpenPositions,
 } from "../state.js";
@@ -241,6 +244,7 @@ export async function deployPosition({
       organic_score,
       amount_sol: finalAmountY,
       amount_x: finalAmountX,
+      base_mint: pool.lbPair.tokenXMint.toString(),
       active_bin: activeBin.binId,
       initial_value_usd,
     });
@@ -379,6 +383,65 @@ let _positionsCache = null;
 let _positionsCacheAt = 0;
 let _positionsInflight = null; // deduplicates concurrent calls
 
+function buildPositionsResult({
+  wallet,
+  positions,
+  source,
+  error = null,
+  degraded = false,
+  positionsKnown = true,
+}) {
+  return {
+    wallet,
+    total_positions: positions.length,
+    positions,
+    source,
+    error,
+    degraded,
+    positions_known: positionsKnown,
+  };
+}
+
+function mapTrackedFallbackPosition(tracked) {
+  return {
+    position: tracked.position,
+    pool: tracked.pool,
+    pair: tracked.pool_name || tracked.pool,
+    base_mint: tracked.base_mint || null,
+    lower_bin: tracked.bin_range?.min ?? null,
+    upper_bin: tracked.bin_range?.max ?? null,
+    active_bin: tracked.active_bin_at_deploy ?? null,
+    in_range: tracked.out_of_range_since ? false : null,
+    unclaimed_fees_usd: null,
+    total_value_usd: null,
+    total_value_true_usd: null,
+    collected_fees_usd: tracked.total_fees_claimed_usd ?? 0,
+    collected_fees_true_usd: tracked.total_fees_claimed_usd ?? 0,
+    pnl_usd: null,
+    pnl_true_usd: null,
+    pnl_pct: null,
+    unclaimed_fees_true_usd: null,
+    fee_per_tvl_24h: null,
+    age_minutes: tracked.deployed_at ? Math.floor((Date.now() - new Date(tracked.deployed_at).getTime()) / 60000) : null,
+    minutes_out_of_range: minutesOutOfRange(tracked.position),
+    instruction: tracked.instruction ?? null,
+    closing_pending_since: tracked.closing_pending_since || null,
+  };
+}
+
+function enrichWithTrackedPosition(position) {
+  const tracked = getTrackedPosition(position.position);
+  if (!tracked) return position;
+  return {
+    ...position,
+    pair: position.pair || tracked.pool_name || position.pool,
+    base_mint: position.base_mint || tracked.base_mint || null,
+    instruction: tracked.instruction ?? position.instruction ?? null,
+    closing_pending_since: tracked.closing_pending_since || null,
+    minutes_out_of_range: position.minutes_out_of_range ?? minutesOutOfRange(position.position),
+  };
+}
+
 // ─── Fetch DLMM PnL API for all positions in a pool ────────────
 async function fetchDlmmPnlForPool(poolAddress, walletAddress) {
   const url = `https://dlmm.datapi.meteora.ag/positions/${poolAddress}/pnl?user=${walletAddress}&status=open&pageSize=100&page=1`;
@@ -446,7 +509,13 @@ export async function getMyPositions({ force = false, silent = false } = {}) {
   try {
     walletAddress = getWallet().publicKey.toString();
   } catch {
-    return { wallet: null, total_positions: 0, positions: [], error: "Wallet not configured" };
+    return buildPositionsResult({
+      wallet: null,
+      positions: [],
+      source: "unavailable",
+      error: "Wallet not configured",
+      positionsKnown: false,
+    });
   }
 
   _positionsInflight = (async () => { try {
@@ -525,14 +594,50 @@ export async function getMyPositions({ force = false, silent = false } = {}) {
       }
     }
 
-    const result = { wallet: walletAddress, total_positions: positions.length, positions };
+    const result = buildPositionsResult({
+      wallet: walletAddress,
+      positions,
+      source: "portfolio",
+      positionsKnown: true,
+    });
     syncOpenPositions(positions.map(p => p.position));
     _positionsCache = result;
     _positionsCacheAt = Date.now();
     return result;
   } catch (error) {
+    const portfolioError = error.message;
     log("positions_error", `Portfolio fetch failed: ${error.stack || error.message}`);
-    return { wallet: walletAddress, total_positions: 0, positions: [], error: error.message };
+
+    try {
+      const onchain = await getWalletPositions({ wallet_address: walletAddress });
+      if (!onchain?.error) {
+        const positions = (onchain.positions || []).map(enrichWithTrackedPosition);
+        const result = buildPositionsResult({
+          wallet: walletAddress,
+          positions,
+          source: "onchain_fallback",
+          error: `Portfolio fetch failed: ${portfolioError}`,
+          degraded: true,
+          positionsKnown: true,
+        });
+        syncOpenPositions(positions.map((p) => p.position));
+        _positionsCache = result;
+        _positionsCacheAt = Date.now();
+        return result;
+      }
+      log("positions_error", `On-chain fallback failed: ${onchain.error}`);
+    } catch (fallbackError) {
+      log("positions_error", `On-chain fallback threw: ${fallbackError.message}`);
+    }
+
+    return buildPositionsResult({
+      wallet: walletAddress,
+      positions: getTrackedPositions(true).map(mapTrackedFallbackPosition),
+      source: "tracked_fallback",
+      error: `Portfolio fetch failed: ${portfolioError}. On-chain fallback unavailable.`,
+      degraded: true,
+      positionsKnown: false,
+    });
   } finally {
     _positionsInflight = null;
   }
@@ -558,11 +663,14 @@ export async function getWalletPositions({ wallet_address }) {
       pool: new PublicKey(acc.account.data.slice(8, 40)).toBase58(),
     }));
 
-    // Enrich with PnL API
-    const uniquePools = [...new Set(raw.map((r) => r.pool))];
-    const pnlMaps = await Promise.all(uniquePools.map((pool) => fetchDlmmPnlForPool(pool, wallet_address)));
     const pnlByPool = {};
-    uniquePools.forEach((pool, i) => { pnlByPool[pool] = pnlMaps[i]; });
+    try {
+      const uniquePools = [...new Set(raw.map((r) => r.pool))];
+      const pnlMaps = await Promise.all(uniquePools.map((pool) => fetchDlmmPnlForPool(pool, wallet_address)));
+      uniquePools.forEach((pool, i) => { pnlByPool[pool] = pnlMaps[i]; });
+    } catch (error) {
+      log("wallet_positions_warn", `PnL enrichment unavailable for ${wallet_address}: ${error.message}`);
+    }
 
     const positions = raw.map((r) => {
       const p = pnlByPool[r.pool]?.[r.position] || null;
@@ -574,10 +682,10 @@ export async function getWalletPositions({ wallet_address }) {
         upper_bin:          p?.upperBinId      ?? null,
         active_bin:         p?.poolActiveBinId ?? null,
         in_range:           p ? !p.isOutOfRange : null,
-        unclaimed_fees_usd: Math.round((p ? (parseFloat(p.unrealizedPnl?.unclaimedFeeTokenX?.usd || 0) + parseFloat(p.unrealizedPnl?.unclaimedFeeTokenY?.usd || 0)) : 0) * 100) / 100,
-        total_value_usd:    Math.round((p ? parseFloat(p.unrealizedPnl?.balances || 0) : 0) * 100) / 100,
-        pnl_usd:            Math.round((p?.pnlUsd ?? 0) * 100) / 100,
-        pnl_pct:            Math.round((p?.pnlPctChange ?? 0) * 100) / 100,
+        unclaimed_fees_usd: p ? Math.round((parseFloat(p.unrealizedPnl?.unclaimedFeeTokenX?.usd || 0) + parseFloat(p.unrealizedPnl?.unclaimedFeeTokenY?.usd || 0)) * 100) / 100 : null,
+        total_value_usd:    p ? Math.round(parseFloat(p.unrealizedPnl?.balances || 0) * 100) / 100 : null,
+        pnl_usd:            p?.pnlUsd != null ? Math.round(p.pnlUsd * 100) / 100 : null,
+        pnl_pct:            p?.pnlPctChange != null ? Math.round(p.pnlPctChange * 100) / 100 : null,
         age_minutes:        p?.createdAt ? Math.floor((Date.now() - p.createdAt * 1000) / 60000) : null,
       };
     });
@@ -763,6 +871,7 @@ export async function closePosition({ position_address, reason }) {
     const txHashes = [...claimTxHashes, ...closeTxHashes];
     log("close", `Step 2 OK (close only): ${closeTxHashes.join(", ") || "none"}`);
     log("close", `SUCCESS txs: ${txHashes.join(", ")}`);
+    markClosingPending(position_address, reason || "agent decision", txHashes);
     // Wait for RPC to reflect withdrawn balances before returning — prevents
     // agent from seeing zero balance when attempting post-close swap
     await new Promise(r => setTimeout(r, 5000));
@@ -786,16 +895,21 @@ export async function closePosition({ position_address, reason }) {
 
     if (!closedConfirmed) {
       return {
-        success: false,
-        error: "Close transactions sent but position still appears open after verification window",
+        success: true,
+        closing_pending: true,
+        close_confirmed: false,
+        message: "Close transactions were submitted, but live position verification is still pending. Do not retry close yet.",
         position: position_address,
         pool: poolAddress,
+        pool_name: tracked?.pool_name || null,
         claim_txs: claimTxHashes,
         close_txs: closeTxHashes,
         txs: txHashes,
+        base_mint: pool.lbPair.tokenXMint.toString(),
       };
     }
 
+    clearClosingPending(position_address);
     recordClose(position_address, reason || "agent decision");
 
     // Record performance for learning

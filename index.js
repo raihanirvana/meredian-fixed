@@ -23,9 +23,8 @@ loadDotenv({ path: ENV_PATH, override: true, quiet: true });
 log("startup", "DLMM LP Agent starting...");
 log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
 log("startup", `Model: ${config.llm.generalModel}`);
+const SOL_SYMBOL = "\u25CE";
 
-const TP_PCT = config.management.takeProfitFeePct;
-const DEPLOY = config.management.deployAmountSol;
 
 // ═══════════════════════════════════════════
 //  CYCLE TIMERS
@@ -49,11 +48,20 @@ function formatCountdown(seconds) {
 }
 
 function getClosePnlDisplay(result) {
-  if (config.management.solMode) {
+  if (config.management.solMode && result.pnl_sol != null) {
+    if (result.pnl_sol != null) {
+      return {
+        symbol: "◎",
+        symbol: SOL_SYMBOL,
+        value: result.pnl_sol,
+        pct: result.pnl_sol_pct ?? result.pnl_pct,
+      };
+    }
     return {
       symbol: "◎",
-      value: result.pnl_sol ?? result.pnl_usd ?? 0,
-      pct: result.pnl_sol_pct ?? result.pnl_pct,
+      symbol: "$",
+      value: result.pnl_usd ?? 0,
+      pct: result.pnl_pct,
     };
   }
   return {
@@ -72,6 +80,10 @@ function getAdaptiveScreeningIntervalMin(now = new Date()) {
     return 60;
   }
   return 30;
+}
+
+function getConfiguredDeploySol() {
+  return config.management.deployAmountSol;
 }
 
 async function executeCircuitBreaker({ reason, positions, announce = true, activate = true }) {
@@ -165,6 +177,11 @@ export async function runManagementCycle({ silent = false } = {}) {
   try {
     const livePositions = await getMyPositions({ force: true }).catch(() => null);
     positions = livePositions?.positions || [];
+    if (livePositions?.positions_known === false) {
+      mgmtReport = `Management skipped — open positions could not be verified (${livePositions.source || "unknown source"}). ${livePositions.error || ""}`.trim();
+      log("cron_warn", mgmtReport);
+      return mgmtReport;
+    }
 
     if (isCircuitBreakerActive()) {
       if (positions.length > 0) {
@@ -256,18 +273,29 @@ export async function runManagementCycle({ silent = false } = {}) {
         actionMap.set(p.position, { action: "CLOSE", rule: 1, reason: "stop loss" });
         continue;
       }
+      const closePendingAgeMs = tracked?.closing_pending_since
+        ? Date.now() - new Date(tracked.closing_pending_since).getTime()
+        : null;
+      if (closePendingAgeMs != null && closePendingAgeMs < 10 * 60_000) {
+        actionMap.set(p.position, { action: "STAY", rule: "pending", reason: "close already submitted — awaiting confirmation" });
+        continue;
+      }
+
       const hasPartialTakeProfit = (tracked?.partial_close_count || 0) > 0;
-      // Rule 2: partial scale-out at +5% once, then let trailing TP manage the runner
-      if (!pnlSuspect && !hasPartialTakeProfit && p.pnl_pct != null && p.pnl_pct >= 5) {
-        actionMap.set(p.position, { action: "PARTIAL_CLOSE", rule: 2, reason: "scale out 50% at +5% PnL" });
-        continue;
+      const partialTakeProfitPct = 5;
+      const hardTakeProfitEnabled = !config.management.trailingTakeProfit;
+      // Rule 2: choose one TP policy — hard TP when trailing is off, otherwise partial scale-out + trailing runner
+      if (!pnlSuspect && !hasPartialTakeProfit && p.pnl_pct != null) {
+        if (hardTakeProfitEnabled && p.pnl_pct >= config.management.takeProfitFeePct) {
+          actionMap.set(p.position, { action: "CLOSE", rule: 2, reason: "take profit" });
+          continue;
+        }
+        if (p.pnl_pct >= partialTakeProfitPct) {
+          actionMap.set(p.position, { action: "PARTIAL_CLOSE", rule: 2, reason: "scale out 50% at +5% PnL" });
+          continue;
+        }
       }
-      // Rule 3: take profit (only before any scale-out has happened)
-      if (!pnlSuspect && !hasPartialTakeProfit && p.pnl_pct != null && p.pnl_pct >= config.management.takeProfitFeePct) {
-        actionMap.set(p.position, { action: "CLOSE", rule: 2, reason: "take profit" });
-        continue;
-      }
-      // Rule 4: pumped far above range
+      // Rule 3: pumped far above range
       if (p.active_bin != null && p.upper_bin != null &&
           p.active_bin > p.upper_bin + config.management.outOfRangeBinsToClose) {
         actionMap.set(p.position, { action: "CLOSE", rule: 3, reason: "pumped far above range" });
@@ -486,7 +514,7 @@ After executing, write a brief one-line result per position.
     // Trigger screening after management
     const afterPositions = await getMyPositions({ force: true }).catch(() => null);
     const afterCount = afterPositions?.positions?.length ?? 0;
-    if (afterCount < config.risk.maxPositions && Date.now() - _screeningLastTriggered > screeningCooldownMs) {
+    if (afterPositions?.positions_known !== false && afterCount < config.risk.maxPositions && Date.now() - _screeningLastTriggered > screeningCooldownMs) {
       log("cron", `Post-management: ${afterCount}/${config.risk.maxPositions} positions — triggering screening`);
       runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
     }
@@ -543,6 +571,11 @@ export async function runScreeningCycle({ silent = false } = {}) {
   let prePositions, preBalance;
   try {
     [prePositions, preBalance] = await Promise.all([getMyPositions({ force: true }), getWalletBalances()]);
+    if (prePositions.positions_known === false) {
+      log("cron", `Screening skipped — open positions unavailable (${prePositions.source || "unknown source"})`);
+      _screeningBusy = false;
+      return null;
+    }
     if (prePositions.total_positions >= config.risk.maxPositions) {
       log("cron", `Screening skipped — max positions reached (${prePositions.total_positions}/${config.risk.maxPositions})`);
       _screeningBusy = false;
@@ -570,7 +603,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     // Load active strategy
     const activeStrategy = getActiveStrategy();
     const strategyBlock = activeStrategy
-      ? `ACTIVE STRATEGY: ${activeStrategy.name} — LP: ${activeStrategy.lp_strategy} | bins_above: ${activeStrategy.range?.bins_above ?? 0} (FIXED — never change) | deposit: ${activeStrategy.entry?.single_side === "sol" ? "SOL only (amount_y, amount_x=0)" : "dual-sided"} | best for: ${activeStrategy.best_for}`
+      ? `ACTIVE STRATEGY: ${activeStrategy.name} — LP: ${activeStrategy.lp_strategy} | bins_above: ${activeStrategy.range?.bins_above ?? 0} (FIXED — never change) | deposit: ${activeStrategy.entry?.single_side === "sol" ? "SOL only (amount_y, amount_x=0)" : activeStrategy.entry?.single_side === "token" ? "TOKEN only (amount_x, amount_y=0)" : "dual-sided"} | best for: ${activeStrategy.best_for}`
       : `No active strategy — use default bid_ask, bins_above: 0, SOL only.`;
 
     // Fetch top candidates, then recon each sequentially with a small delay to avoid 429s
@@ -692,7 +725,8 @@ ${candidateBlocks.join("\n\n")}
 STEPS:
 1. Pick the best candidate based on narrative quality, smart wallets, and pool metrics.
 2. Call deploy_position (active_bin is pre-fetched above — no need to call get_active_bin).
-   bins_below = round(35 + (volatility/5)*55) clamped to [35,90].
+   bins_below = round(35 + (volatility/5)*34) clamped to [35,69].
+   bins_above = 0 for bid_ask unless the active strategy explicitly requires a different positive value.
 3. Report in this exact format (no tables, no extra sections):
    Decision: DEPLOYED PAIR
    pool: <name> | <pool address>
@@ -780,6 +814,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
     _pnlPollBusy = true;
     try {
       const result = await getMyPositions({ force: true, silent: true }).catch(() => null);
+      if (result?.positions_known === false) return;
       if (!result?.positions?.length) return;
       for (const p of result.positions) {
         const exit = updatePnlAndCheckExits(p.position, p, config.management);
@@ -1005,6 +1040,7 @@ if (isTTY) {
           const closeTxs = result.close_txs?.length ? result.close_txs : result.txs;
           const claimNote = result.claim_txs?.length ? `\nClaim txs: ${result.claim_txs.join(", ")}` : "";
           const pnl = getClosePnlDisplay(result);
+          const pnlSymbol = config.management.solMode && result.pnl_sol != null ? "◎" : pnl.symbol;
           await sendMessage(`✅ Closed ${pos.pair}\nPnL: ${pnl.symbol}${pnl.value ?? "?"}${pnl.pct != null ? ` (${pnl.pct}%)` : ""} | close txs: ${closeTxs?.join(", ") || "n/a"}${claimNote}`);
         } else {
           await sendMessage(`❌ Close failed: ${JSON.stringify(result)}`);
@@ -1067,7 +1103,7 @@ if (isTTY) {
 
   console.log(`
 Commands:
-  1 / 2 / 3 ...  Deploy ${DEPLOY} SOL into that pool
+  1 / 2 / 3 ...  Deploy ${getConfiguredDeploySol()} SOL into that pool
   auto           Let the agent pick and deploy automatically
   /status        Refresh wallet + positions
   /candidates    Refresh top pool list
@@ -1090,9 +1126,9 @@ Commands:
     if (!isNaN(pick) && pick >= 1 && pick <= startupCandidates.length) {
       await runBusy(async () => {
         const pool = startupCandidates[pick - 1];
-        console.log(`\nDeploying ${DEPLOY} SOL into ${pool.name}...\n`);
+        console.log(`\nDeploying ${getConfiguredDeploySol()} SOL into ${pool.name}...\n`);
         const { content: reply } = await agentLoop(
-          `Deploy ${DEPLOY} SOL into pool ${pool.pool} (${pool.name}). Call get_active_bin first then deploy_position. Report result.`,
+          `Deploy ${getConfiguredDeploySol()} SOL into pool ${pool.pool} (${pool.name}). Call get_active_bin first then deploy_position. Report result.`,
           config.llm.maxSteps,
           [],
           "SCREENER"
@@ -1108,7 +1144,7 @@ Commands:
       await runBusy(async () => {
         console.log("\nAgent is picking and deploying...\n");
         const { content: reply } = await agentLoop(
-          `get_top_candidates, pick the best one, get_active_bin, deploy_position with ${DEPLOY} SOL. Execute now, don't ask.`,
+          `get_top_candidates, pick the best one, get_active_bin, deploy_position with ${getConfiguredDeploySol()} SOL. Execute now, don't ask.`,
           config.llm.maxSteps,
           [],
           "SCREENER"
@@ -1283,7 +1319,7 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
     try {
       await agentLoop(`
 STARTUP CHECK
-1. get_wallet_balance. 2. get_my_positions. 3. If SOL >= ${config.management.minSolToOpen}: get_top_candidates then deploy ${DEPLOY} SOL. 4. Report.
+1. get_wallet_balance. 2. get_my_positions. 3. If SOL >= ${config.management.minSolToOpen}: get_top_candidates then deploy ${getConfiguredDeploySol()} SOL. 4. Report.
       `, config.llm.maxSteps, [], "SCREENER");
     } catch (e) {
       log("startup_error", e.message);

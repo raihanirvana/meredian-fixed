@@ -35,6 +35,126 @@ const execAsync = promisify(exec);
 // Registered by index.js so update_config can restart cron jobs when intervals change
 let _cronRestarter = null;
 export function registerCronRestarter(fn) { _cronRestarter = fn; }
+const SOL_SYMBOL = "\u25CE";
+
+function validateNumberConfig(key, value, { min = -Infinity, max = Infinity, integer = false, allowNull = false } = {}) {
+  if (allowNull && (value == null || value === "")) return null;
+  const num = typeof value === "string" ? Number(value) : value;
+  if (!Number.isFinite(num)) {
+    throw new Error(`${key} must be a finite number`);
+  }
+  if (integer && !Number.isInteger(num)) {
+    throw new Error(`${key} must be an integer`);
+  }
+  if (num < min || num > max) {
+    throw new Error(`${key} must be between ${min} and ${max}`);
+  }
+  return num;
+}
+
+function validateBooleanConfig(key, value) {
+  if (typeof value === "boolean") return value;
+  if (value === "true") return true;
+  if (value === "false") return false;
+  throw new Error(`${key} must be true or false`);
+}
+
+function validateStringConfig(key, value, { choices = null } = {}) {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error(`${key} must be a non-empty string`);
+  }
+  const normalized = value.trim();
+  if (choices && !choices.includes(normalized)) {
+    throw new Error(`${key} must be one of: ${choices.join(", ")}`);
+  }
+  return normalized;
+}
+
+const CONFIG_VALIDATORS = {
+  minFeeActiveTvlRatio: (v) => validateNumberConfig("minFeeActiveTvlRatio", v, { min: 0, max: 100 }),
+  minTvl: (v) => validateNumberConfig("minTvl", v, { min: 0, max: 1_000_000_000 }),
+  maxTvl: (v) => validateNumberConfig("maxTvl", v, { min: 1_000, max: 1_000_000_000 }),
+  minVolume: (v) => validateNumberConfig("minVolume", v, { min: 0, max: 1_000_000_000 }),
+  minOrganic: (v) => validateNumberConfig("minOrganic", v, { min: 0, max: 100 }),
+  minHolders: (v) => validateNumberConfig("minHolders", v, { min: 0, max: 10_000_000, integer: true }),
+  minMcap: (v) => validateNumberConfig("minMcap", v, { min: 0, max: 1_000_000_000_000 }),
+  maxMcap: (v) => validateNumberConfig("maxMcap", v, { min: 0, max: 1_000_000_000_000 }),
+  minBinStep: (v) => validateNumberConfig("minBinStep", v, { min: 1, max: 1000, integer: true }),
+  maxBinStep: (v) => validateNumberConfig("maxBinStep", v, { min: 1, max: 1000, integer: true }),
+  timeframe: (v) => validateStringConfig("timeframe", v),
+  category: (v) => validateStringConfig("category", v),
+  minTokenFeesSol: (v) => validateNumberConfig("minTokenFeesSol", v, { min: 0, max: 1_000_000 }),
+  maxBundlePct: (v) => validateNumberConfig("maxBundlePct", v, { min: 0, max: 100 }),
+  maxBotHoldersPct: (v) => validateNumberConfig("maxBotHoldersPct", v, { min: 0, max: 100 }),
+  maxTop10Pct: (v) => validateNumberConfig("maxTop10Pct", v, { min: 0, max: 100 }),
+  minTokenAgeHours: (v) => validateNumberConfig("minTokenAgeHours", v, { min: 0, max: 24 * 365, allowNull: true }),
+  maxTokenAgeHours: (v) => validateNumberConfig("maxTokenAgeHours", v, { min: 0, max: 24 * 365, allowNull: true }),
+  athFilterPct: (v) => validateNumberConfig("athFilterPct", v, { min: -99.9, max: 10_000, allowNull: true }),
+  minVolumeTrendPct: (v) => validateNumberConfig("minVolumeTrendPct", v, { min: -100, max: 10_000 }),
+  minFeePerTvl24h: (v) => validateNumberConfig("minFeePerTvl24h", v, { min: 0, max: 10_000 }),
+  minClaimAmount: (v) => validateNumberConfig("minClaimAmount", v, { min: 0, max: 1_000_000 }),
+  autoSwapAfterClaim: (v) => validateBooleanConfig("autoSwapAfterClaim", v),
+  outOfRangeBinsToClose: (v) => validateNumberConfig("outOfRangeBinsToClose", v, { min: 1, max: 10_000, integer: true }),
+  outOfRangeWaitMinutes: (v) => validateNumberConfig("outOfRangeWaitMinutes", v, { min: 1, max: 7 * 24 * 60, integer: true }),
+  minAgeBeforeYieldCheck: (v) => validateNumberConfig("minAgeBeforeYieldCheck", v, { min: 0, max: 7 * 24 * 60, integer: true }),
+  stopLossPct: (v) => validateNumberConfig("stopLossPct", v, { min: -99.9, max: -0.1 }),
+  takeProfitFeePct: (v) => validateNumberConfig("takeProfitFeePct", v, { min: 0.1, max: 10_000 }),
+  trailingTakeProfit: (v) => validateBooleanConfig("trailingTakeProfit", v),
+  trailingTriggerPct: (v) => validateNumberConfig("trailingTriggerPct", v, { min: 0.1, max: 10_000 }),
+  trailingDropPct: (v) => validateNumberConfig("trailingDropPct", v, { min: 0.1, max: 10_000 }),
+  solMode: (v) => validateBooleanConfig("solMode", v),
+  maxHoldMinutes: (v) => validateNumberConfig("maxHoldMinutes", v, { min: 1, max: 365 * 24 * 60, allowNull: true, integer: true }),
+  maxDailyLossSol: (v) => validateNumberConfig("maxDailyLossSol", v, { min: 0.01, max: 1_000_000, allowNull: true }),
+  dailyProfitTargetSol: (v) => validateNumberConfig("dailyProfitTargetSol", v, { min: 0.01, max: 1_000_000, allowNull: true }),
+  maxRebalancesPerPosition: (v) => validateNumberConfig("maxRebalancesPerPosition", v, { min: 0, max: 50, integer: true }),
+  autoCompoundFees: (v) => validateBooleanConfig("autoCompoundFees", v),
+  minSolToOpen: (v) => validateNumberConfig("minSolToOpen", v, { min: 0.05, max: 10_000 }),
+  deployAmountSol: (v) => validateNumberConfig("deployAmountSol", v, { min: 0.05, max: 10_000 }),
+  gasReserve: (v) => validateNumberConfig("gasReserve", v, { min: 0.01, max: 100 }),
+  positionSizePct: (v) => validateNumberConfig("positionSizePct", v, { min: 0.01, max: 1 }),
+  maxPositions: (v) => validateNumberConfig("maxPositions", v, { min: 1, max: 100, integer: true }),
+  maxDeployAmount: (v) => validateNumberConfig("maxDeployAmount", v, { min: 0.05, max: 10_000 }),
+  managementIntervalMin: (v) => validateNumberConfig("managementIntervalMin", v, { min: 1, max: 24 * 60, integer: true }),
+  screeningIntervalMin: (v) => validateNumberConfig("screeningIntervalMin", v, { min: 1, max: 24 * 60, integer: true }),
+  healthCheckIntervalMin: (v) => validateNumberConfig("healthCheckIntervalMin", v, { min: 1, max: 24 * 60, integer: true }),
+  managementModel: (v) => validateStringConfig("managementModel", v),
+  screeningModel: (v) => validateStringConfig("screeningModel", v),
+  generalModel: (v) => validateStringConfig("generalModel", v),
+  binsBelow: (v) => validateNumberConfig("binsBelow", v, { min: 1, max: 1400, integer: true }),
+};
+
+function validateConfigValue(key, value) {
+  const validator = CONFIG_VALIDATORS[key];
+  return validator ? validator(value) : value;
+}
+
+function validateConfigPreview(preview) {
+  if (preview.screening.maxTvl < preview.screening.minTvl) {
+    throw new Error("maxTvl must be >= minTvl");
+  }
+  if (preview.screening.maxMcap < preview.screening.minMcap) {
+    throw new Error("maxMcap must be >= minMcap");
+  }
+  if (
+    preview.screening.minTokenAgeHours != null &&
+    preview.screening.maxTokenAgeHours != null &&
+    preview.screening.maxTokenAgeHours < preview.screening.minTokenAgeHours
+  ) {
+    throw new Error("maxTokenAgeHours must be >= minTokenAgeHours");
+  }
+  if (preview.screening.maxBinStep < preview.screening.minBinStep) {
+    throw new Error("maxBinStep must be >= minBinStep");
+  }
+  if (preview.risk.maxDeployAmount < preview.management.deployAmountSol) {
+    throw new Error("maxDeployAmount must be >= deployAmountSol");
+  }
+  if (preview.management.minSolToOpen < preview.management.gasReserve) {
+    throw new Error("minSolToOpen must be >= gasReserve");
+  }
+  if (preview.management.trailingTakeProfit && preview.management.trailingDropPct >= preview.management.trailingTriggerPct) {
+    throw new Error("trailingDropPct must be smaller than trailingTriggerPct when trailingTakeProfit is enabled");
+  }
+}
 
 // Map tool names to implementations
 const toolMap = {
@@ -208,8 +328,43 @@ const toolMap = {
       return { success: false, unknown, reason };
     }
 
-    // Apply to live config immediately
+    const normalized = {};
+    const invalid = [];
     for (const [key, val] of Object.entries(applied)) {
+      try {
+        normalized[key] = validateConfigValue(key, val);
+      } catch (error) {
+        invalid.push({ key, value: val, error: error.message });
+      }
+    }
+
+    if (invalid.length > 0) {
+      log("config", `update_config rejected invalid values: ${JSON.stringify(invalid)}`);
+      return { success: false, unknown, invalid, reason };
+    }
+
+    const preview = {
+      screening: { ...config.screening },
+      management: { ...config.management },
+      risk: { ...config.risk },
+      schedule: { ...config.schedule },
+      llm: { ...config.llm },
+      strategy: { ...config.strategy },
+    };
+    for (const [key, val] of Object.entries(normalized)) {
+      const [section, field] = CONFIG_MAP[key];
+      preview[section][field] = val;
+    }
+
+    try {
+      validateConfigPreview(preview);
+    } catch (error) {
+      log("config", `update_config rejected preview: ${error.message}`);
+      return { success: false, unknown, invalid: [{ error: error.message }], reason };
+    }
+
+    // Apply to live config immediately
+    for (const [key, val] of Object.entries(normalized)) {
       const [section, field] = CONFIG_MAP[key];
       const before = config[section][field];
       config[section][field] = val;
@@ -221,15 +376,15 @@ const toolMap = {
     if (fs.existsSync(USER_CONFIG_PATH)) {
       try { userConfig = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8").replace(/^\uFEFF/, "")); } catch { /**/ }
     }
-    Object.assign(userConfig, applied);
+    Object.assign(userConfig, normalized);
     userConfig._lastAgentTune = new Date().toISOString();
     fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(userConfig, null, 2));
 
     // Restart cron jobs if intervals changed
     const intervalChanged =
-      applied.managementIntervalMin != null ||
-      applied.screeningIntervalMin != null ||
-      applied.healthCheckIntervalMin != null;
+      normalized.managementIntervalMin != null ||
+      normalized.screeningIntervalMin != null ||
+      normalized.healthCheckIntervalMin != null;
     if (intervalChanged && _cronRestarter) {
       _cronRestarter();
       log("config", `Cron restarted — management: ${config.schedule.managementIntervalMin}m, screening: ${config.schedule.screeningIntervalMin}m`);
@@ -238,16 +393,17 @@ const toolMap = {
     // Save as a lesson — but skip ephemeral per-deploy interval changes
     // (managementIntervalMin / screeningIntervalMin change every deploy based on volatility;
     //  the rule is already in the system prompt, storing it 75+ times is pure noise)
-    const lessonsKeys = Object.keys(applied).filter(
+    const lessonsKeys = Object.keys(normalized).filter(
       k => k !== "managementIntervalMin" && k !== "screeningIntervalMin"
     );
     if (lessonsKeys.length > 0) {
-      const summary = lessonsKeys.map(k => `${k}=${applied[k]}`).join(", ");
+      const summary = lessonsKeys.map(k => `${k}=${normalized[k]}`).join(", ");
       addLesson(`[SELF-TUNED] Changed ${summary} — ${reason}`, ["self_tune", "config_change"]);
     }
 
     log("config", `Agent self-tuned: ${JSON.stringify(applied)} — ${reason}`);
-    return { success: true, applied, unknown, reason };
+    log("config", `Agent self-tuned (normalized): ${JSON.stringify(normalized)} — ${reason}`);
+    return { success: true, applied: normalized, unknown, reason };
   },
 };
 
@@ -324,6 +480,10 @@ export async function executeTool(name, args) {
         }
         notifyDeploy({ pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
       } else if (name === "close_position") {
+        if (result.closing_pending) {
+          log("executor", `Close submitted for ${args.position_address}; awaiting confirmation before retry or post-close swap`);
+          result.auto_swap_note = "Close transaction already submitted. Do NOT retry close_position yet, and wait for confirmation before any swap.";
+        } else {
         // Record daily P&L in SOL — prefer absolute SOL PnL when available.
         const pnlPctForRecord = result.pnl_sol_pct ?? result.pnl_pct;
         if (result.pnl_sol != null) {
@@ -333,14 +493,18 @@ export async function executeTool(name, args) {
           const amountSol = tracked?.amount_sol || 0;
           recordDailyPnl(amountSol * (pnlPctForRecord / 100));
         }
-        const pnlValue = config.management.solMode
-          ? (result.pnl_sol ?? result.pnl_usd ?? 0)
+        const displayCloseInSol = config.management.solMode && result.pnl_sol != null;
+        const pnlValue = displayCloseInSol
+          ? result.pnl_sol
           : (result.pnl_usd ?? 0);
         notifyClose({
           pair: result.pool_name || args.position_address?.slice(0, 8),
           pnlValue,
-          pnlPct: config.management.solMode ? (result.pnl_sol_pct ?? result.pnl_pct ?? 0) : (result.pnl_pct ?? 0),
+          pnlPct: displayCloseInSol ? (result.pnl_sol_pct ?? result.pnl_pct ?? 0) : (result.pnl_pct ?? 0),
           currencySymbol: config.management.solMode ? "◎" : "$",
+          currencySymbol: displayCloseInSol ? "◎" : "$",
+          currencySymbol: displayCloseInSol ? "◎" : "$",
+          currencySymbol: displayCloseInSol ? SOL_SYMBOL : "$",
         }).catch(() => {});
         // Note low-yield closes in pool memory so screener avoids redeploying
         if (args.reason && args.reason.toLowerCase().includes("yield")) {
@@ -368,6 +532,7 @@ export async function executeTool(name, args) {
           } catch (e) {
             log("executor_warn", `Auto-swap after close failed: ${e.message}`);
           }
+        }
         }
       } else if (name === "claim_fees") {
         if ((result.claimed_fees_sol ?? 0) > 0 || (result.claimed_fees_usd ?? 0) > 0) {
@@ -479,6 +644,12 @@ async function runSafetyChecks(name, args) {
 
       // Check position count limit + duplicate pool guard — force fresh scan to avoid stale cache
       const positions = await getMyPositions({ force: true });
+      if (positions.positions_known === false) {
+        return {
+          pass: false,
+          reason: `Open positions could not be verified (${positions.source || "unknown source"}). ${positions.error || "Try again once live position data recovers."}`,
+        };
+      }
       const effectiveOpenPositions = positions.total_positions - (args.rebalance_from ? 1 : 0);
       if (effectiveOpenPositions >= config.risk.maxPositions) {
         return {
@@ -510,26 +681,29 @@ async function runSafetyChecks(name, args) {
       }
 
       // Check amount limits
+      const amountX = args.amount_x ?? 0;
       const amountY = args.amount_y ?? args.amount_sol ?? 0;
-      if (amountY <= 0) {
+      if (amountY <= 0 && amountX <= 0) {
         return {
           pass: false,
-          reason: `Must provide a positive SOL amount (amount_y).`,
+          reason: `Must provide a positive deposit amount. Use amount_y/amount_sol for SOL-side, amount_x for token-side, or both.`,
         };
       }
 
-      const minDeploy = Math.max(0.1, config.management.deployAmountSol);
-      if (amountY < minDeploy) {
-        return {
-          pass: false,
-          reason: `Amount ${amountY} SOL is below the minimum deploy amount (${minDeploy} SOL). Use at least ${minDeploy} SOL.`,
-        };
-      }
-      if (amountY > config.risk.maxDeployAmount) {
-        return {
-          pass: false,
-          reason: `SOL amount ${amountY} exceeds maximum allowed per position (${config.risk.maxDeployAmount}).`,
-        };
+      if (amountY > 0) {
+        const minDeploy = Math.max(0.1, config.management.deployAmountSol);
+        if (amountY < minDeploy) {
+          return {
+            pass: false,
+            reason: `Amount ${amountY} SOL is below the minimum deploy amount (${minDeploy} SOL). Use at least ${minDeploy} SOL.`,
+          };
+        }
+        if (amountY > config.risk.maxDeployAmount) {
+          return {
+            pass: false,
+            reason: `SOL amount ${amountY} exceeds maximum allowed per position (${config.risk.maxDeployAmount}).`,
+          };
+        }
       }
 
       // Check SOL balance
